@@ -24,6 +24,7 @@ enum lv_remote_msg_type {
     LV_REMOTE_MSG_INPUT_POINTER,
     LV_REMOTE_MSG_INPUT_KEY,
     LV_REMOTE_MSG_CLOSE_WINDOW,
+    LV_REMOTE_MSG_TERMINATE,
 };
 
 enum lv_remote_key_action {
@@ -50,6 +51,8 @@ struct lv_remote_msg {
     uint32_t buttons;
     uint32_t key;
     uint32_t action;
+    uint32_t pid;
+    uint32_t reserved;
     char title[LV_REMOTE_MAX_TITLE];
     char path[LV_REMOTE_MAX_PATH];
 };

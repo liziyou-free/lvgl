@@ -159,6 +159,7 @@ static int remote_register_window(const char *title)
     msg.serial = ++g_remote.serial;
     msg.width = g_remote.width;
     msg.height = g_remote.height;
+    msg.pid = (uint32_t)getpid();
     snprintf(msg.title, sizeof(msg.title), "%s", title);
     if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
         fprintf(stderr, "send CREATE_WINDOW failed: %s\n", strerror(errno));
@@ -232,6 +233,10 @@ static void remote_handle_msg(const struct lv_remote_msg *msg)
     }
 
     switch (msg->type) {
+    case LV_REMOTE_MSG_CLOSE_WINDOW:
+    case LV_REMOTE_MSG_TERMINATE:
+        exit(0);
+        break;
     case LV_REMOTE_MSG_INPUT_POINTER:
         g_remote.pointer_x = clamp_i16(msg->x, 0, (int32_t)g_remote.width - 1);
         g_remote.pointer_y = clamp_i16(msg->y, 0, (int32_t)g_remote.height - 1);

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -93,6 +94,7 @@ struct remote_window {
     uint32_t height;
     uint32_t stride;
     uint32_t format;
+    pid_t pid;
     size_t surface_len;
     uint8_t *surface;
     char title[LV_REMOTE_MAX_TITLE];
@@ -100,6 +102,10 @@ struct remote_window {
     uint8_t rxbuf[sizeof(struct lv_remote_msg)];
     size_t rx_len;
     lv_obj_t *panel;
+    lv_obj_t *title_bar;
+    lv_obj_t *close_button;
+    lv_obj_t *min_button;
+    lv_obj_t *zoom_button;
     lv_obj_t *title_label;
     lv_obj_t *image;
     lv_image_dsc_t image_dsc;
@@ -120,6 +126,19 @@ static int g_server_fd = -1;
 static uint32_t g_next_window_id = 1;
 static lv_obj_t *g_workspace;
 static lv_obj_t *g_status;
+
+struct drag_state {
+    struct remote_window *win;
+    int16_t start_x;
+    int16_t start_y;
+    int32_t panel_x;
+    int32_t panel_y;
+    bool active;
+};
+
+static struct drag_state g_drag;
+
+static void remote_destroy(struct remote_window *win);
 
 static uint32_t tick_get_ms(void)
 {
@@ -405,6 +424,25 @@ static void remote_send_key(struct remote_window *win, uint32_t key, uint32_t ac
     }
 }
 
+static void remote_request_close(struct remote_window *win)
+{
+    struct lv_remote_msg msg;
+
+    if (win == NULL || !win->active) {
+        return;
+    }
+
+    lv_remote_msg_init(&msg, LV_REMOTE_MSG_CLOSE_WINDOW);
+    msg.window_id = win->window_id;
+    lv_remote_send_msg(win->fd, &msg);
+
+    if (win->pid > 0) {
+        kill(win->pid, SIGTERM);
+    }
+
+    remote_destroy(win);
+}
+
 static void remote_focus(struct remote_window *win)
 {
     if (g_focused == win) {
@@ -424,6 +462,88 @@ static void remote_focus(struct remote_window *win)
                                       LV_PART_MAIN);
         lv_obj_move_to_index(g_focused->panel,
                              lv_obj_get_child_count(g_workspace) - 1);
+    }
+}
+
+static struct remote_window *remote_from_obj(lv_obj_t *obj)
+{
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        struct remote_window *win = &g_windows[i];
+
+        if (!win->active) {
+            continue;
+        }
+
+        if (obj == win->panel || obj == win->title_bar ||
+            obj == win->close_button || obj == win->min_button ||
+            obj == win->zoom_button || obj == win->title_label ||
+            obj == win->image) {
+            return win;
+        }
+    }
+
+    return NULL;
+}
+
+static void window_close_event_cb(lv_event_t *event)
+{
+    lv_obj_t *target = lv_event_get_target(event);
+    struct remote_window *win = remote_from_obj(target);
+
+    remote_request_close(win);
+}
+
+static void window_drag_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *target = lv_event_get_target(event);
+    struct remote_window *win = remote_from_obj(target);
+
+    if (win == NULL || win->panel == NULL) {
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSED) {
+        remote_focus(win);
+        g_drag.win = win;
+        g_drag.start_x = g_input.x;
+        g_drag.start_y = g_input.y;
+        g_drag.panel_x = lv_obj_get_x(win->panel);
+        g_drag.panel_y = lv_obj_get_y(win->panel);
+        g_drag.active = true;
+    } else if (code == LV_EVENT_PRESSING && g_drag.active && g_drag.win == win) {
+        int32_t next_x = g_drag.panel_x + (int32_t)g_input.x - g_drag.start_x;
+        int32_t next_y = g_drag.panel_y + (int32_t)g_input.y - g_drag.start_y;
+        int32_t max_x = (int32_t)lv_obj_get_width(g_workspace) -
+                        (int32_t)lv_obj_get_width(win->panel);
+        int32_t max_y = (int32_t)lv_obj_get_height(g_workspace) -
+                        (int32_t)lv_obj_get_height(win->panel);
+
+        if (max_x < 0) {
+            max_x = 0;
+        }
+
+        if (max_y < 0) {
+            max_y = 0;
+        }
+
+        if (next_x < 0) {
+            next_x = 0;
+        } else if (next_x > max_x) {
+            next_x = max_x;
+        }
+
+        if (next_y < 0) {
+            next_y = 0;
+        } else if (next_y > max_y) {
+            next_y = max_y;
+        }
+
+        lv_obj_set_pos(win->panel, next_x, next_y);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (g_drag.win == win) {
+            memset(&g_drag, 0, sizeof(g_drag));
+        }
     }
 }
 
@@ -629,7 +749,7 @@ static void remote_destroy(struct remote_window *win)
 static void remote_create_ui(struct remote_window *win)
 {
     int idx = (int)(win - g_windows);
-    lv_obj_t *bar;
+    lv_obj_t *btn;
 
     if (win->panel != NULL) {
         return;
@@ -644,19 +764,48 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_set_style_border_color(win->panel, lv_color_hex(0x64748b), LV_PART_MAIN);
     lv_obj_set_style_pad_all(win->panel, 4, LV_PART_MAIN);
 
-    bar = lv_obj_create(win->panel);
-    lv_obj_set_size(bar, LV_PCT(100), 24);
-    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x1f2937), LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(bar, 8, LV_PART_MAIN);
-    lv_obj_set_style_pad_ver(bar, 3, LV_PART_MAIN);
+    win->title_bar = lv_obj_create(win->panel);
+    lv_obj_set_size(win->title_bar, LV_PCT(100), 24);
+    lv_obj_align(win->title_bar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(win->title_bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_border_width(win->title_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(win->title_bar, lv_color_hex(0x1f2937), LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(win->title_bar, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(win->title_bar, 3, LV_PART_MAIN);
+    lv_obj_add_event_cb(win->title_bar, window_drag_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(win->title_bar, window_drag_event_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(win->title_bar, window_drag_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(win->title_bar, window_drag_event_cb, LV_EVENT_PRESS_LOST, NULL);
 
-    win->title_label = lv_label_create(bar);
+    btn = lv_button_create(win->title_bar);
+    win->close_button = btn;
+    lv_obj_set_size(btn, 12, 12);
+    lv_obj_align(btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xff5f57), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, window_close_event_cb, LV_EVENT_CLICKED, NULL);
+
+    btn = lv_button_create(win->title_bar);
+    win->min_button = btn;
+    lv_obj_set_size(btn, 12, 12);
+    lv_obj_align(btn, LV_ALIGN_LEFT_MID, 18, 0);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xffbd2e), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+
+    btn = lv_button_create(win->title_bar);
+    win->zoom_button = btn;
+    lv_obj_set_size(btn, 12, 12);
+    lv_obj_align(btn, LV_ALIGN_LEFT_MID, 36, 0);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x28c840), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+
+    win->title_label = lv_label_create(win->title_bar);
     lv_label_set_text(win->title_label, win->title);
     lv_obj_set_style_text_color(win->title_label, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_obj_align(win->title_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_align(win->title_label, LV_ALIGN_LEFT_MID, 58, 0);
 
     win->image = lv_image_create(win->panel);
     lv_obj_set_size(win->image, win->width, win->height);
@@ -732,14 +881,18 @@ static void remote_handle_msg(struct remote_window *win,
         if (msg->title[0] != '\0') {
             snprintf(win->title, sizeof(win->title), "%s", msg->title);
         }
+        if (msg->pid != 0U) {
+            win->pid = (pid_t)msg->pid;
+        }
         if (msg->width > 0) {
             win->width = msg->width;
         }
         if (msg->height > 0) {
             win->height = msg->height;
         }
-        printf("lvgl_desktop: window %u create '%s' %ux%u\n",
-               win->window_id, win->title, win->width, win->height);
+        printf("lvgl_desktop: window %u create '%s' %ux%u pid=%ld\n",
+               win->window_id, win->title, win->width, win->height,
+               (long)win->pid);
         break;
     case LV_REMOTE_MSG_ATTACH_BUFFER:
         if (remote_attach_buffer(win, msg) < 0) {
