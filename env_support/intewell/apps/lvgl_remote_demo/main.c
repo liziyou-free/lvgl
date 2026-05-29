@@ -78,6 +78,37 @@ static void set_nonblock(int fd)
     }
 }
 
+static int write_all_at(int fd, off_t offset, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        return -1;
+    }
+
+    while (len > 0) {
+        ssize_t nwritten = write(fd, p, len);
+
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (nwritten == 0) {
+            errno = EIO;
+            return -1;
+        }
+
+        p += nwritten;
+        len -= (size_t)nwritten;
+    }
+
+    return 0;
+}
+
 static int remote_connect(void)
 {
     struct sockaddr_un addr;
@@ -100,21 +131,36 @@ static int remote_connect(void)
         return -1;
     }
 
-    set_nonblock(fd);
     return fd;
 }
 
 static int remote_create_surface(struct remote_ctx *remote)
 {
-    mkdir(LV_REMOTE_SURFACE_DIR, 0777);
-    snprintf(remote->surface_path, sizeof(remote->surface_path),
-             "%s/lvgl-surface-%ld.fb", LV_REMOTE_SURFACE_DIR, (long)getpid());
+    uint32_t stamp = tick_get_ms();
+    int last_errno = EEXIST;
 
-    remote->surface_fd = open(remote->surface_path, O_RDWR | O_CREAT | O_TRUNC,
-                              0666);
+    mkdir(LV_REMOTE_SURFACE_DIR, 0777);
+
+    for (uint32_t attempt = 0; attempt < 64U; attempt++) {
+        snprintf(remote->surface_path, sizeof(remote->surface_path),
+                 "%s/lvgl-surface-%ld-%08x-%u.fb", LV_REMOTE_SURFACE_DIR,
+                 (long)getpid(), stamp, attempt);
+
+        remote->surface_fd = open(remote->surface_path,
+                                  O_RDWR | O_CREAT | O_EXCL | O_TRUNC, 0666);
+        if (remote->surface_fd >= 0) {
+            break;
+        }
+
+        last_errno = errno;
+        if (errno != EEXIST) {
+            break;
+        }
+    }
+
     if (remote->surface_fd < 0) {
         fprintf(stderr, "open %s failed: %s\n", remote->surface_path,
-                strerror(errno));
+                strerror(last_errno));
         return -1;
     }
 
@@ -143,6 +189,7 @@ static int remote_send_simple(uint32_t type)
 
     lv_remote_msg_init(&msg, type);
     msg.serial = ++g_remote.serial;
+    msg.pid = (uint32_t)getpid();
     return lv_remote_send_msg(g_remote.socket_fd, &msg);
 }
 
@@ -172,12 +219,14 @@ static int remote_register_window(const char *title)
     msg.height = g_remote.height;
     msg.stride = g_remote.stride;
     msg.format = LV_REMOTE_FORMAT_RGB565;
+    msg.pid = (uint32_t)getpid();
     snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
     if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
         fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
         return -1;
     }
 
+    set_nonblock(g_remote.socket_fd);
     printf("lvgl_remote_demo: registered '%s' %ux%u %s\n",
            title, g_remote.width, g_remote.height, g_remote.surface_path);
     return 0;
@@ -186,25 +235,63 @@ static int remote_register_window(const char *title)
 static void remote_flush(lv_display_t *disp, const lv_area_t *area,
                          uint8_t *px_map)
 {
-    uint32_t width = (uint32_t)(area->x2 - area->x1 + 1);
-    uint32_t height = (uint32_t)(area->y2 - area->y1 + 1);
+    int32_t x1 = area->x1;
+    int32_t y1 = area->y1;
+    int32_t x2 = area->x2;
+    int32_t y2 = area->y2;
+    uint32_t width;
+    uint32_t height;
     struct lv_remote_msg msg;
 
+    if (x2 < 0 || y2 < 0 ||
+        x1 >= (int32_t)g_remote.width ||
+        y1 >= (int32_t)g_remote.height) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    if (x1 < 0) {
+        x1 = 0;
+    }
+
+    if (y1 < 0) {
+        y1 = 0;
+    }
+
+    if (x2 >= (int32_t)g_remote.width) {
+        x2 = (int32_t)g_remote.width - 1;
+    }
+
+    if (y2 >= (int32_t)g_remote.height) {
+        y2 = (int32_t)g_remote.height - 1;
+    }
+
+    width = (uint32_t)(x2 - x1 + 1);
+    height = (uint32_t)(y2 - y1 + 1);
+
     for (uint32_t row = 0; row < height; row++) {
-        uint8_t *dst = g_remote.surface +
-                       ((uint32_t)area->y1 + row) * g_remote.stride +
-                       (uint32_t)area->x1 * BYTES_PER_PIXEL;
-        const uint8_t *src = px_map + row * width * BYTES_PER_PIXEL;
+        size_t offset = ((size_t)y1 + row) * g_remote.stride +
+                        (size_t)x1 * BYTES_PER_PIXEL;
+        uint8_t *dst = g_remote.surface + ((uint32_t)y1 + row) *
+                       g_remote.stride + (uint32_t)x1 * BYTES_PER_PIXEL;
+        const uint8_t *src = px_map + offset;
 
         memcpy(dst, src, width * BYTES_PER_PIXEL);
+        if (write_all_at(g_remote.surface_fd, (off_t)offset, dst,
+                         (size_t)width * BYTES_PER_PIXEL) < 0) {
+            fprintf(stderr, "sync surface failed: %s\n", strerror(errno));
+            lv_display_flush_ready(disp);
+            return;
+        }
     }
 
     lv_remote_msg_init(&msg, LV_REMOTE_MSG_COMMIT);
     msg.serial = ++g_remote.serial;
-    msg.x = area->x1;
-    msg.y = area->y1;
+    msg.x = x1;
+    msg.y = y1;
     msg.w = (int32_t)width;
     msg.h = (int32_t)height;
+    msg.pid = (uint32_t)getpid();
     if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK) {
         fprintf(stderr, "commit failed: %s\n", strerror(errno));
@@ -229,6 +316,10 @@ static int16_t clamp_i16(int32_t value, int32_t min, int32_t max)
 static void remote_handle_msg(const struct lv_remote_msg *msg)
 {
     if (!lv_remote_msg_valid(msg)) {
+        return;
+    }
+
+    if (msg->pid != 0U && msg->pid != (uint32_t)getpid()) {
         return;
     }
 
@@ -273,7 +364,7 @@ static void remote_poll(void)
 
         if (nread == 0) {
             fprintf(stderr, "desktop disconnected\n");
-            return;
+            exit(0);
         }
 
         g_remote.rx_len += (size_t)nread;
@@ -363,6 +454,24 @@ static void ui_create(void)
     lv_bar_set_value(bar, 70, LV_ANIM_OFF);
 }
 
+static void remote_close_surface(struct remote_ctx *remote)
+{
+    if (remote->surface != NULL) {
+        munmap(remote->surface, remote->surface_len);
+        remote->surface = NULL;
+    }
+
+    if (remote->surface_fd >= 0) {
+        close(remote->surface_fd);
+        remote->surface_fd = -1;
+    }
+
+    if (remote->surface_path[0] != '\0') {
+        unlink(remote->surface_path);
+        remote->surface_path[0] = '\0';
+    }
+}
+
 static void parse_args(int argc, char **argv, uint32_t *width, uint32_t *height)
 {
     *width = DEFAULT_WIDTH;
@@ -401,11 +510,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (remote_register_window("Remote LVGL Demo") < 0) {
-        fprintf(stderr, "register window failed: %s\n", strerror(errno));
-        return 1;
-    }
-
     draw_buf = malloc(g_remote.surface_len);
     if (draw_buf == NULL) {
         fprintf(stderr, "malloc draw buffer failed\n");
@@ -430,6 +534,11 @@ int main(int argc, char **argv)
     ui_create();
     lv_obj_invalidate(lv_screen_active());
 
+    if (remote_register_window("Remote LVGL Demo") < 0) {
+        fprintf(stderr, "register window failed: %s\n", strerror(errno));
+        return 1;
+    }
+
     printf("lvgl_remote_demo: %ux%u RGB565 surface=%s socket=%s\n",
            g_remote.width, g_remote.height, g_remote.surface_path,
            LV_REMOTE_SOCKET_PATH);
@@ -442,5 +551,6 @@ int main(int argc, char **argv)
         sleep_ms(idle == 0 ? 5U : idle > 10U ? 10U : idle);
     }
 
+    remote_close_surface(&g_remote);
     return 0;
 }

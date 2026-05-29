@@ -2,6 +2,7 @@
 #define INTEWELL_LV_REMOTE_H
 
 #include <errno.h>
+#include <time.h>
 #include <stdint.h>
 #include <unistd.h>
 
@@ -11,6 +12,7 @@
 #define LV_REMOTE_VERSION 1U
 #define LV_REMOTE_MAX_TITLE 64U
 #define LV_REMOTE_MAX_PATH 128U
+#define LV_REMOTE_WINDOW_TOPMOST 0x00000001U
 
 enum lv_remote_format {
     LV_REMOTE_FORMAT_RGB565 = 1,
@@ -88,6 +90,10 @@ static inline int lv_remote_write_full(int fd, const void *buf, size_t len)
         if (nwritten < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -1;
             }
 
             return -1;

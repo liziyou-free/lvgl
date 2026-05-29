@@ -9,7 +9,7 @@ CFLAGS := -O2 -g -Wall -Wextra $(filter-out -O0 -O1 -O2 -O3 -Os -Og,$(CFLAGS))
 CFLAGS += -std=c99 -D_GNU_SOURCE -DLV_DISABLE_API_MAPPING -DLV_CONF_INCLUDE_SIMPLE=1 -DLV_CONF_PATH=\"lv_conf.h\"
 CFLAGS += -I. -I$(LVGL_DIR) -I$(LVGL_DIR)/include -I$(LVGL_DIR)/env_support/intewell
 LDFLAGS ?= -static
-LDLIBS ?= -lm
+LDLIBS ?= -lm -pthread
 
 LVGL_SRCS := \
 	$(LVGL_DIR)/src/lv_init.c \

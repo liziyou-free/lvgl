@@ -134,6 +134,7 @@ static bool g_ctrl_down;
 static volatile sig_atomic_t g_exit_requested;
 
 static void terminal_handle_key(uint32_t key, uint8_t action);
+static void pty_poll_output(struct pty_ctx *pty);
 
 static void signal_handler(int signo)
 {
@@ -172,6 +173,37 @@ static void set_nonblock(int fd)
     }
 }
 
+static int write_all_at(int fd, off_t offset, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        return -1;
+    }
+
+    while (len > 0) {
+        ssize_t nwritten = write(fd, p, len);
+
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (nwritten == 0) {
+            errno = EIO;
+            return -1;
+        }
+
+        p += nwritten;
+        len -= (size_t)nwritten;
+    }
+
+    return 0;
+}
+
 static int remote_connect(void)
 {
     struct sockaddr_un addr;
@@ -194,21 +226,36 @@ static int remote_connect(void)
         return -1;
     }
 
-    set_nonblock(fd);
     return fd;
 }
 
 static int remote_create_surface(struct remote_ctx *remote)
 {
-    mkdir(LV_REMOTE_SURFACE_DIR, 0777);
-    snprintf(remote->surface_path, sizeof(remote->surface_path),
-             "%s/lvgl-surface-%ld.fb", LV_REMOTE_SURFACE_DIR, (long)getpid());
+    uint32_t stamp = tick_get_ms();
+    int last_errno = EEXIST;
 
-    remote->surface_fd = open(remote->surface_path, O_RDWR | O_CREAT | O_TRUNC,
-                              0666);
+    mkdir(LV_REMOTE_SURFACE_DIR, 0777);
+
+    for (uint32_t attempt = 0; attempt < 64U; attempt++) {
+        snprintf(remote->surface_path, sizeof(remote->surface_path),
+                 "%s/lvgl-surface-%ld-%08x-%u.fb", LV_REMOTE_SURFACE_DIR,
+                 (long)getpid(), stamp, attempt);
+
+        remote->surface_fd = open(remote->surface_path,
+                                  O_RDWR | O_CREAT | O_EXCL | O_TRUNC, 0666);
+        if (remote->surface_fd >= 0) {
+            break;
+        }
+
+        last_errno = errno;
+        if (errno != EEXIST) {
+            break;
+        }
+    }
+
     if (remote->surface_fd < 0) {
         fprintf(stderr, "open %s failed: %s\n", remote->surface_path,
-                strerror(errno));
+                strerror(last_errno));
         return -1;
     }
 
@@ -237,7 +284,72 @@ static int remote_send_simple(uint32_t type)
 
     lv_remote_msg_init(&msg, type);
     msg.serial = ++g_remote.serial;
+    msg.pid = (uint32_t)getpid();
     return lv_remote_send_msg(g_remote.socket_fd, &msg);
+}
+
+static int remote_commit_area(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    struct lv_remote_msg msg;
+
+    lv_remote_msg_init(&msg, LV_REMOTE_MSG_COMMIT);
+    msg.serial = ++g_remote.serial;
+    msg.x = x;
+    msg.y = y;
+    msg.w = w;
+    msg.h = h;
+    msg.pid = (uint32_t)getpid();
+    return lv_remote_send_msg(g_remote.socket_fd, &msg);
+}
+
+static int remote_sync_area_to_file(int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+    for (uint32_t row = 0; row < h; row++) {
+        size_t offset = ((size_t)y + row) * g_remote.stride +
+                        (size_t)x * BYTES_PER_PIXEL;
+
+        if (write_all_at(g_remote.surface_fd, (off_t)offset,
+                         g_remote.surface + offset,
+                         (size_t)w * BYTES_PER_PIXEL) < 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void remote_debug_paint_surface(void)
+{
+    uint16_t *pixels = (uint16_t *)g_remote.surface;
+
+    if (g_remote.surface == NULL) {
+        return;
+    }
+
+    for (uint32_t y = 0; y < g_remote.height; y++) {
+        uint16_t color = 0x001f;
+
+        if (y < g_remote.height / 3U) {
+            color = 0xf800;
+        } else if (y < (g_remote.height * 2U) / 3U) {
+            color = 0x07e0;
+        }
+
+        for (uint32_t x = 0; x < g_remote.width; x++) {
+            uint8_t *row = g_remote.surface + y * g_remote.stride;
+            pixels = (uint16_t *)row;
+            pixels[x] = color;
+        }
+    }
+
+    printf("lvgl_remote_terminal: debug surface bars painted first=%04x\n",
+           ((uint16_t *)g_remote.surface)[0]);
+    fflush(stdout);
+    if (remote_sync_area_to_file(0, 0, g_remote.width, g_remote.height) < 0) {
+        fprintf(stderr, "sync debug surface failed: %s\n", strerror(errno));
+    }
+    (void)remote_commit_area(0, 0, (int32_t)g_remote.width,
+                             (int32_t)g_remote.height);
 }
 
 static int remote_register_window(const char *title)
@@ -266,12 +378,14 @@ static int remote_register_window(const char *title)
     msg.height = g_remote.height;
     msg.stride = g_remote.stride;
     msg.format = LV_REMOTE_FORMAT_RGB565;
+    msg.pid = (uint32_t)getpid();
     snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
     if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
         fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
         return -1;
     }
 
+    set_nonblock(g_remote.socket_fd);
     printf("lvgl_remote_terminal: registered '%s' %ux%u %s\n",
            title, g_remote.width, g_remote.height, g_remote.surface_path);
     return 0;
@@ -280,26 +394,66 @@ static int remote_register_window(const char *title)
 static void remote_flush(lv_display_t *disp, const lv_area_t *area,
                          uint8_t *px_map)
 {
-    uint32_t width = (uint32_t)(area->x2 - area->x1 + 1);
-    uint32_t height = (uint32_t)(area->y2 - area->y1 + 1);
-    struct lv_remote_msg msg;
+    int32_t x1 = area->x1;
+    int32_t y1 = area->y1;
+    int32_t x2 = area->x2;
+    int32_t y2 = area->y2;
+    uint32_t width;
+    uint32_t height;
+    static int flush_log_count;
+
+    if (x2 < 0 || y2 < 0 ||
+        x1 >= (int32_t)g_remote.width ||
+        y1 >= (int32_t)g_remote.height) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    if (x1 < 0) {
+        x1 = 0;
+    }
+
+    if (y1 < 0) {
+        y1 = 0;
+    }
+
+    if (x2 >= (int32_t)g_remote.width) {
+        x2 = (int32_t)g_remote.width - 1;
+    }
+
+    if (y2 >= (int32_t)g_remote.height) {
+        y2 = (int32_t)g_remote.height - 1;
+    }
+
+    width = (uint32_t)(x2 - x1 + 1);
+    height = (uint32_t)(y2 - y1 + 1);
 
     for (uint32_t row = 0; row < height; row++) {
-        uint8_t *dst = g_remote.surface +
-                       ((uint32_t)area->y1 + row) * g_remote.stride +
-                       (uint32_t)area->x1 * BYTES_PER_PIXEL;
-        const uint8_t *src = px_map + row * width * BYTES_PER_PIXEL;
+        uint8_t *dst = g_remote.surface + ((uint32_t)y1 + row) *
+                       g_remote.stride + (uint32_t)x1 * BYTES_PER_PIXEL;
+        const uint8_t *src = px_map + ((uint32_t)y1 + row) *
+                             g_remote.stride + (uint32_t)x1 * BYTES_PER_PIXEL;
 
         memcpy(dst, src, width * BYTES_PER_PIXEL);
     }
 
-    lv_remote_msg_init(&msg, LV_REMOTE_MSG_COMMIT);
-    msg.serial = ++g_remote.serial;
-    msg.x = area->x1;
-    msg.y = area->y1;
-    msg.w = (int32_t)width;
-    msg.h = (int32_t)height;
-    if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0 &&
+    if (remote_sync_area_to_file(x1, y1, width, height) < 0) {
+        fprintf(stderr, "sync surface failed: %s\n", strerror(errno));
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    if (flush_log_count < 8) {
+        const uint16_t *sample = (const uint16_t *)px_map;
+
+        printf("lvgl_remote_terminal: flush %ld,%ld-%ld,%ld clipped %ld,%ld %ux%u sample=%04x\n",
+               (long)area->x1, (long)area->y1, (long)area->x2, (long)area->y2,
+               (long)x1, (long)y1, width, height, sample[0]);
+        fflush(stdout);
+        flush_log_count++;
+    }
+
+    if (remote_commit_area(x1, y1, (int32_t)width, (int32_t)height) < 0 &&
         errno != EAGAIN && errno != EWOULDBLOCK) {
         fprintf(stderr, "commit failed: %s\n", strerror(errno));
     }
@@ -326,6 +480,10 @@ static void remote_handle_msg(const struct lv_remote_msg *msg)
         return;
     }
 
+    if (msg->pid != 0U && msg->pid != (uint32_t)getpid()) {
+        return;
+    }
+
     switch (msg->type) {
     case LV_REMOTE_MSG_CLOSE_WINDOW:
     case LV_REMOTE_MSG_TERMINATE:
@@ -338,6 +496,7 @@ static void remote_handle_msg(const struct lv_remote_msg *msg)
         break;
     case LV_REMOTE_MSG_INPUT_KEY:
         terminal_handle_key(msg->key, (uint8_t)msg->action);
+        pty_poll_output(&g_pty);
         break;
     default:
         break;
@@ -366,6 +525,7 @@ static void remote_poll(void)
 
         if (nread == 0) {
             fprintf(stderr, "desktop disconnected\n");
+            g_exit_requested = 1;
             return;
         }
 
@@ -405,8 +565,12 @@ static void pointer_register(lv_display_t *disp)
 
 static void term_refresh(void)
 {
-    lv_textarea_set_text(g_output, g_term);
-    lv_textarea_set_cursor_pos(g_output, LV_TEXTAREA_CURSOR_LAST);
+    if (g_output == NULL) {
+        return;
+    }
+
+    lv_label_set_text(g_output, g_term);
+    lv_obj_invalidate(lv_screen_active());
 }
 
 static void term_append(const char *text)
@@ -485,6 +649,7 @@ static void term_append_data(const char *data, size_t len)
                 out--;
             } else if (g_term_len > 0) {
                 g_term[--g_term_len] = '\0';
+                term_refresh();
             }
             continue;
         }
@@ -723,6 +888,7 @@ static void shell_execute_line(struct shell_state *shell, const char *input)
 static void shell_handle_byte(struct shell_state *shell, char ch)
 {
     if (ch == '\r' || ch == '\n') {
+        dprintf(shell->pty_fd, "\r\n");
         shell->line[shell->len] = '\0';
         shell_execute_line(shell, shell->line);
         shell->len = 0;
@@ -735,6 +901,7 @@ static void shell_handle_byte(struct shell_state *shell, char ch)
         if (shell->len > 0) {
             shell->len--;
             shell->line[shell->len] = '\0';
+            dprintf(shell->pty_fd, "\b \b");
         }
         return;
     }
@@ -742,6 +909,7 @@ static void shell_handle_byte(struct shell_state *shell, char ch)
     if (isprint((unsigned char)ch) && shell->len + 1U < sizeof(shell->line)) {
         shell->line[shell->len++] = ch;
         shell->line[shell->len] = '\0';
+        dprintf(shell->pty_fd, "%c", ch);
     }
 }
 
@@ -824,6 +992,24 @@ fail:
     return -1;
 }
 
+static void pty_configure_slave(int slave_fd)
+{
+    struct termios tio;
+
+    if (tcgetattr(slave_fd, &tio) < 0) {
+        return;
+    }
+
+    tio.c_iflag &= (tcflag_t)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    tio.c_oflag &= (tcflag_t)~OPOST;
+    tio.c_cflag |= CS8;
+    tio.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
+    tio.c_cc[VMIN] = 1;
+    tio.c_cc[VTIME] = 0;
+
+    (void)tcsetattr(slave_fd, TCSANOW, &tio);
+}
+
 static int pty_spawn_shell(struct pty_ctx *pty, const char *cwd)
 {
     pid_t pid;
@@ -845,6 +1031,7 @@ static int pty_spawn_shell(struct pty_ctx *pty, const char *cwd)
         }
 
         ioctl(slave_fd, TIOCSCTTY, 0);
+        pty_configure_slave(slave_fd);
         dup2(slave_fd, STDIN_FILENO);
         dup2(slave_fd, STDOUT_FILENO);
         dup2(slave_fd, STDERR_FILENO);
@@ -871,8 +1058,28 @@ static void pty_close(struct pty_ctx *pty)
     }
 }
 
+static void remote_close_surface(struct remote_ctx *remote)
+{
+    if (remote->surface != NULL) {
+        munmap(remote->surface, remote->surface_len);
+        remote->surface = NULL;
+    }
+
+    if (remote->surface_fd >= 0) {
+        close(remote->surface_fd);
+        remote->surface_fd = -1;
+    }
+
+    if (remote->surface_path[0] != '\0') {
+        unlink(remote->surface_path);
+        remote->surface_path[0] = '\0';
+    }
+}
+
 static void pty_poll_output(struct pty_ctx *pty)
 {
+    bool updated = false;
+
     if (pty->master_fd >= 0) {
         char buf[512];
         ssize_t nread;
@@ -881,6 +1088,7 @@ static void pty_poll_output(struct pty_ctx *pty)
             nread = read(pty->master_fd, buf, sizeof(buf));
             if (nread > 0) {
                 term_append_data(buf, (size_t)nread);
+                updated = true;
             }
         } while (nread > 0);
     }
@@ -895,12 +1103,41 @@ static void pty_poll_output(struct pty_ctx *pty)
                         WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         }
     }
+
+    if (updated) {
+        lv_obj_invalidate(lv_screen_active());
+    }
 }
 
 static void pty_write_text(struct pty_ctx *pty, const char *text)
 {
+    const char *p = text;
+    size_t len = strlen(text);
+
     if (pty->master_fd >= 0) {
-        write(pty->master_fd, text, strlen(text));
+        while (len > 0U) {
+            ssize_t nwritten = write(pty->master_fd, p, len);
+
+            if (nwritten < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    sleep_ms(1);
+                    continue;
+                }
+
+                return;
+            }
+
+            if (nwritten == 0) {
+                return;
+            }
+
+            p += (size_t)nwritten;
+            len -= (size_t)nwritten;
+        }
     }
 }
 
@@ -946,9 +1183,9 @@ static void terminal_handle_key(uint32_t key, uint8_t action)
             ch = (char)(key - 'A' + 1);
         }
 
-        if (g_pty.master_fd >= 0) {
-            write(g_pty.master_fd, &ch, 1);
-        }
+        char text[2] = { ch, '\0' };
+
+        pty_write_text(&g_pty, text);
     }
 }
 
@@ -989,16 +1226,11 @@ static void ui_create(const char *cwd)
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    g_output = lv_textarea_create(content);
+    g_output = lv_label_create(content);
     lv_obj_set_width(g_output, LV_PCT(100));
-    lv_obj_set_height(g_output, LV_PCT(100));
-    lv_textarea_set_one_line(g_output, false);
-    lv_textarea_set_cursor_click_pos(g_output, false);
-    lv_obj_remove_flag(g_output, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_bg_color(g_output, lv_color_hex(0x05070a), LV_PART_MAIN);
+    lv_label_set_long_mode(g_output, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_bg_opa(g_output, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_text_color(g_output, lv_color_hex(0xd1fae5), LV_PART_MAIN);
-    lv_obj_set_style_border_color(g_output, lv_color_hex(0x374151), LV_PART_MAIN);
-    lv_obj_set_style_radius(g_output, 4, LV_PART_MAIN);
     lv_obj_set_style_text_font(g_output, &lv_font_montserrat_14, LV_PART_MAIN);
 
     term_refresh();
@@ -1034,11 +1266,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (remote_register_window("Terminal") < 0) {
-        fprintf(stderr, "register window failed: %s\n", strerror(errno));
-        return 1;
-    }
-
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
@@ -1063,7 +1290,7 @@ int main(int argc, char **argv)
                                        g_remote.stride, LV_DISPLAY_RENDER_MODE_FULL);
     pointer_register(disp);
     ui_create(cwd);
-    lv_obj_invalidate(lv_screen_active());
+    term_append("LVGL remote terminal UI ready\n");
 
     if (pty_open_master(&g_pty, DEFAULT_PTMX) == 0) {
         if (pty_spawn_shell(&g_pty, cwd) < 0) {
@@ -1073,8 +1300,17 @@ int main(int argc, char **argv)
         term_append("failed to open /dev/ptmx; rebuild kernel with CONFIG_PSEUDOTERM\n");
     }
 
+    pty_poll_output(&g_pty);
+    lv_obj_invalidate(lv_screen_active());
+
+    if (remote_register_window("Terminal") < 0) {
+        fprintf(stderr, "register window failed: %s\n", strerror(errno));
+        return 1;
+    }
+    remote_debug_paint_surface();
+
     for (;;) {
-        uint32_t idle = lv_timer_handler();
+        uint32_t idle;
 
         if (g_exit_requested) {
             if (g_pty.child_running && g_pty.child_pid > 0) {
@@ -1083,14 +1319,17 @@ int main(int argc, char **argv)
                 g_pty.child_running = false;
             }
             pty_close(&g_pty);
+            remote_close_surface(&g_remote);
             return 0;
         }
 
         remote_poll();
         pty_poll_output(&g_pty);
+        idle = lv_timer_handler();
         sleep_ms(idle == 0 ? 5U : idle > 10U ? 10U : idle);
     }
 
     pty_close(&g_pty);
+    remote_close_surface(&g_remote);
     return 0;
 }

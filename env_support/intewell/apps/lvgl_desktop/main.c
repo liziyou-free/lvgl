@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,6 +30,8 @@
 #define BYTES_PER_PIXEL 2
 #define FB_BUFFER_COUNT 2
 #define MAX_REMOTE_WINDOWS 8
+#define MAX_PENDING_CLIENTS 16
+#define MAX_PENDING_MESSAGES 64
 #define KEYBOARD_PRESS 1
 
 #define TOUCH_POS_VALID 0x02
@@ -73,6 +76,7 @@ struct input_ctx {
     int16_t x;
     int16_t y;
     bool pressed;
+    bool last_pressed;
 };
 
 struct keyboard_event {
@@ -82,14 +86,17 @@ struct keyboard_event {
 
 struct keyboard_ctx {
     int fd;
+    char path[64];
 };
 
 struct remote_window {
     bool active;
     bool focused;
+    bool topmost;
     int fd;
     int surface_fd;
     uint32_t window_id;
+    uint32_t generation;
     uint32_t width;
     uint32_t height;
     uint32_t stride;
@@ -97,6 +104,7 @@ struct remote_window {
     pid_t pid;
     size_t surface_len;
     uint8_t *surface;
+    uint8_t *image_pixels;
     char title[LV_REMOTE_MAX_TITLE];
     char path[LV_REMOTE_MAX_PATH];
     uint8_t rxbuf[sizeof(struct lv_remote_msg)];
@@ -108,7 +116,17 @@ struct remote_window {
     lv_obj_t *zoom_button;
     lv_obj_t *title_label;
     lv_obj_t *image;
-    lv_image_dsc_t image_dsc;
+    pthread_t rx_thread;
+    bool rx_thread_started;
+    pthread_t tx_thread;
+    bool tx_thread_started;
+    pthread_mutex_t tx_lock;
+    pthread_cond_t tx_cond;
+    bool tx_stop;
+    struct lv_remote_msg tx_queue[64];
+    uint8_t tx_head;
+    uint8_t tx_tail;
+    uint8_t tx_count;
 };
 
 static struct fb_ctx g_fb = {
@@ -124,6 +142,7 @@ static struct remote_window g_windows[MAX_REMOTE_WINDOWS];
 static struct remote_window *g_focused;
 static int g_server_fd = -1;
 static uint32_t g_next_window_id = 1;
+static uint32_t g_next_window_generation = 1;
 static lv_obj_t *g_workspace;
 static lv_obj_t *g_status;
 
@@ -138,7 +157,263 @@ struct drag_state {
 
 static struct drag_state g_drag;
 
+struct pending_clients {
+    pthread_mutex_t lock;
+    int fd[MAX_PENDING_CLIENTS];
+    size_t head;
+    size_t tail;
+    size_t count;
+};
+
+static struct pending_clients g_pending_clients = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+struct pending_message {
+    size_t slot;
+    uint32_t generation;
+    bool disconnect;
+    struct lv_remote_msg msg;
+};
+
+struct pending_messages {
+    pthread_mutex_t lock;
+    struct pending_message msg[MAX_PENDING_MESSAGES];
+    size_t head;
+    size_t tail;
+    size_t count;
+};
+
+static struct pending_messages g_pending_messages = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+static pthread_t g_accept_thread;
+static bool g_accept_thread_started;
+
 static void remote_destroy(struct remote_window *win);
+static void remote_composite_surfaces(uint8_t *fb);
+static void sleep_ms(uint32_t ms);
+
+static struct remote_window *remote_from_panel(lv_obj_t *panel)
+{
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        if (g_windows[i].active && g_windows[i].panel == panel) {
+            return &g_windows[i];
+        }
+    }
+
+    return NULL;
+}
+
+static struct remote_window *remote_find_by_pid(uint32_t pid)
+{
+    if (pid == 0U) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        if (g_windows[i].active && g_windows[i].pid == (pid_t)pid) {
+            return &g_windows[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void remote_tx_shutdown(struct remote_window *win)
+{
+    if (win == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&win->tx_lock);
+    win->tx_stop = true;
+    pthread_cond_broadcast(&win->tx_cond);
+    pthread_mutex_unlock(&win->tx_lock);
+}
+
+static bool remote_tx_enqueue(struct remote_window *win,
+                              const struct lv_remote_msg *msg)
+{
+    bool queued = false;
+
+    if (win == NULL || msg == NULL || win->fd < 0) {
+        return false;
+    }
+
+    pthread_mutex_lock(&win->tx_lock);
+    if (!win->tx_stop && win->tx_count < (uint8_t)(sizeof(win->tx_queue) /
+                                                   sizeof(win->tx_queue[0]))) {
+        win->tx_queue[win->tx_tail] = *msg;
+        win->tx_tail = (uint8_t)((win->tx_tail + 1U) %
+                                 (sizeof(win->tx_queue) / sizeof(win->tx_queue[0])));
+        win->tx_count++;
+        queued = true;
+        pthread_cond_signal(&win->tx_cond);
+    }
+    pthread_mutex_unlock(&win->tx_lock);
+
+    return queued;
+}
+
+static void *remote_tx_thread_main(void *arg)
+{
+    struct remote_window *win = arg;
+
+    for (;;) {
+        struct lv_remote_msg msg;
+
+        pthread_mutex_lock(&win->tx_lock);
+        while (!win->tx_stop && win->tx_count == 0U) {
+            pthread_cond_wait(&win->tx_cond, &win->tx_lock);
+        }
+
+        if (win->tx_stop && win->tx_count == 0U) {
+            pthread_mutex_unlock(&win->tx_lock);
+            return NULL;
+        }
+
+        msg = win->tx_queue[win->tx_head];
+        win->tx_head = (uint8_t)((win->tx_head + 1U) %
+                                 (sizeof(win->tx_queue) / sizeof(win->tx_queue[0])));
+        win->tx_count--;
+        pthread_mutex_unlock(&win->tx_lock);
+
+        if (lv_remote_send_msg(win->fd, &msg) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                sleep_ms(1);
+                if (!remote_tx_enqueue(win, &msg)) {
+                    fprintf(stderr, "drop queued input for window %u\n",
+                            win->window_id);
+                }
+                continue;
+            }
+
+            fprintf(stderr, "send input to window %u failed: %s\n",
+                    win->window_id, strerror(errno));
+        }
+    }
+}
+
+static void remote_start_tx_thread(struct remote_window *win)
+{
+    int ret;
+
+    if (win == NULL || win->tx_thread_started) {
+        return;
+    }
+
+    ret = pthread_create(&win->tx_thread, NULL, remote_tx_thread_main, win);
+    if (ret != 0) {
+        fprintf(stderr, "pthread_create window %u tx failed: %s\n",
+                win->window_id, strerror(ret));
+        return;
+    }
+
+    win->tx_thread_started = true;
+}
+
+static struct remote_window *remote_find_unbound_window(void)
+{
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        if (g_windows[i].active && g_windows[i].pid == 0 &&
+            g_windows[i].panel == NULL) {
+            return &g_windows[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int read_all_at(int fd, off_t offset, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        return -1;
+    }
+
+    while (len > 0) {
+        ssize_t nread = read(fd, p, len);
+
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (nread == 0) {
+            errno = EIO;
+            return -1;
+        }
+
+        p += nread;
+        len -= (size_t)nread;
+    }
+
+    return 0;
+}
+
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+
+    while (len > 0U) {
+        ssize_t nread = read(fd, p, len);
+
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (nread == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+
+        p += (size_t)nread;
+        len -= (size_t)nread;
+    }
+
+    return 0;
+}
+
+static struct remote_window *remote_top_window(void)
+{
+    uint32_t child_count;
+
+    if (g_workspace == NULL) {
+        return NULL;
+    }
+
+    child_count = lv_obj_get_child_count(g_workspace);
+    for (int32_t i = (int32_t)child_count - 1; i >= 0; i--) {
+        lv_obj_t *child = lv_obj_get_child(g_workspace, i);
+        struct remote_window *win = remote_from_panel(child);
+
+        if (win != NULL && !lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
+            return win;
+        }
+    }
+
+    return NULL;
+}
+
+static bool remote_has_windows(void)
+{
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        if (g_windows[i].active && g_windows[i].panel != NULL) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static uint32_t tick_get_ms(void)
 {
@@ -160,15 +435,6 @@ static void sleep_ms(uint32_t ms)
     ts.tv_sec = ms / 1000U;
     ts.tv_nsec = (long)(ms % 1000U) * 1000000L;
     nanosleep(&ts, NULL);
-}
-
-static void set_nonblock(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-
-    if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
 }
 
 static uint16_t fb_convert_rgb565(uint16_t color)
@@ -288,20 +554,22 @@ static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
         return;
     }
 
-    if (FB_SWAP_RB) {
-        uint16_t *pix = (uint16_t *)px_map;
-        size_t count = g_fb.frame_len / sizeof(uint16_t);
+    if (lv_display_flush_is_last(disp)) {
+        remote_composite_surfaces(px_map);
 
-        for (size_t i = 0; i < count; i++) {
-            pix[i] = fb_convert_rgb565(pix[i]);
+        if (FB_SWAP_RB) {
+            uint16_t *pix = (uint16_t *)px_map;
+            size_t count = g_fb.frame_len / sizeof(uint16_t);
+
+            for (size_t i = 0; i < count; i++) {
+                pix[i] = fb_convert_rgb565(pix[i]);
+            }
         }
-    }
 
 #if FB_SWAP_BYTES
-    lv_draw_sw_rgb565_swap(px_map, g_fb.frame_len / sizeof(uint16_t));
+        lv_draw_sw_rgb565_swap(px_map, g_fb.frame_len / sizeof(uint16_t));
 #endif
 
-    if (lv_display_flush_is_last(disp)) {
         if (!g_fb.mapped) {
             struct fb_area_s update;
 
@@ -396,13 +664,14 @@ static void remote_send_pointer(struct remote_window *win, int32_t x, int32_t y,
 
     lv_remote_msg_init(&msg, LV_REMOTE_MSG_INPUT_POINTER);
     msg.window_id = win->window_id;
+    msg.pid = (uint32_t)win->pid;
     msg.x = x;
     msg.y = y;
     msg.buttons = pressed ? 1U : 0U;
     msg.action = pressed ? LV_REMOTE_KEY_PRESS : LV_REMOTE_KEY_RELEASE;
-    if (lv_remote_send_msg(win->fd, &msg) < 0) {
-        fprintf(stderr, "send pointer to window %u failed: %s\n",
-                win->window_id, strerror(errno));
+    if (!remote_tx_enqueue(win, &msg)) {
+        fprintf(stderr, "queue pointer to window %u failed\n",
+                win->window_id);
     }
 }
 
@@ -416,11 +685,12 @@ static void remote_send_key(struct remote_window *win, uint32_t key, uint32_t ac
 
     lv_remote_msg_init(&msg, LV_REMOTE_MSG_INPUT_KEY);
     msg.window_id = win->window_id;
+    msg.pid = (uint32_t)win->pid;
     msg.key = key;
     msg.action = action;
-    if (lv_remote_send_msg(win->fd, &msg) < 0) {
-        fprintf(stderr, "send key to window %u failed: %s\n",
-                win->window_id, strerror(errno));
+    if (!remote_tx_enqueue(win, &msg)) {
+        fprintf(stderr, "queue key to window %u failed\n",
+                win->window_id);
     }
 }
 
@@ -434,7 +704,8 @@ static void remote_request_close(struct remote_window *win)
 
     lv_remote_msg_init(&msg, LV_REMOTE_MSG_CLOSE_WINDOW);
     msg.window_id = win->window_id;
-    lv_remote_send_msg(win->fd, &msg);
+    msg.pid = (uint32_t)win->pid;
+    (void)remote_tx_enqueue(win, &msg);
 
     if (win->pid > 0) {
         kill(win->pid, SIGTERM);
@@ -443,13 +714,36 @@ static void remote_request_close(struct remote_window *win)
     remote_destroy(win);
 }
 
-static void remote_focus(struct remote_window *win)
+static void remote_raise_topmost_windows(void)
 {
-    if (g_focused == win) {
+    if (g_workspace == NULL) {
         return;
     }
 
-    if (g_focused != NULL && g_focused->panel != NULL) {
+    for (uint32_t i = 0; i < lv_obj_get_child_count(g_workspace); i++) {
+        struct remote_window *win = remote_from_panel(lv_obj_get_child(g_workspace, i));
+
+        if (win != NULL && win->topmost &&
+            !lv_obj_has_flag(win->panel, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_move_to_index(win->panel,
+                                 lv_obj_get_child_count(g_workspace) - 1);
+        }
+    }
+}
+
+static void remote_raise_window(struct remote_window *win)
+{
+    if (win == NULL || win->panel == NULL || g_workspace == NULL) {
+        return;
+    }
+
+    lv_obj_move_to_index(win->panel, lv_obj_get_child_count(g_workspace) - 1);
+    remote_raise_topmost_windows();
+}
+
+static void remote_focus(struct remote_window *win)
+{
+    if (g_focused != NULL && g_focused != win && g_focused->panel != NULL) {
         g_focused->focused = false;
         lv_obj_set_style_border_color(g_focused->panel, lv_color_hex(0x64748b),
                                       LV_PART_MAIN);
@@ -460,8 +754,7 @@ static void remote_focus(struct remote_window *win)
         g_focused->focused = true;
         lv_obj_set_style_border_color(g_focused->panel, lv_color_hex(0x2563eb),
                                       LV_PART_MAIN);
-        lv_obj_move_to_index(g_focused->panel,
-                             lv_obj_get_child_count(g_workspace) - 1);
+        remote_raise_window(g_focused);
     }
 }
 
@@ -491,6 +784,17 @@ static void window_close_event_cb(lv_event_t *event)
     struct remote_window *win = remote_from_obj(target);
 
     remote_request_close(win);
+}
+
+static void window_focus_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *target = lv_event_get_target(event);
+    struct remote_window *win = remote_from_obj(target);
+
+    if (code == LV_EVENT_PRESSED) {
+        remote_focus(win);
+    }
 }
 
 static void window_drag_event_cb(lv_event_t *event)
@@ -547,13 +851,217 @@ static void window_drag_event_cb(lv_event_t *event)
     }
 }
 
+static void remote_surface_draw_cb(lv_event_t *event)
+{
+    (void)event;
+}
+
+static void remote_pick_initial_position(struct remote_window *win,
+                                         int32_t panel_w, int32_t panel_h,
+                                         int32_t *out_x, int32_t *out_y)
+{
+    static uint32_t spawn_serial;
+    const int32_t start = 20;
+    const int32_t step = 28;
+    int32_t max_x = (int32_t)lv_obj_get_width(g_workspace) - panel_w;
+    int32_t max_y = (int32_t)lv_obj_get_height(g_workspace) - panel_h;
+    int32_t x = start + (int32_t)(spawn_serial * step);
+    int32_t y = start + (int32_t)(spawn_serial * step);
+
+    (void)win;
+
+    if (max_x < 0) {
+        max_x = 0;
+    }
+
+    if (max_y < 0) {
+        max_y = 0;
+    }
+
+    spawn_serial++;
+    if (x > max_x || y > max_y) {
+        x = start + (int32_t)((spawn_serial % 4U) * step);
+        y = start + (int32_t)((spawn_serial % 4U) * step);
+    }
+
+    if (x > max_x) {
+        x = max_x;
+    }
+
+    if (y > max_y) {
+        y = max_y;
+    }
+
+    *out_x = x < 0 ? 0 : x;
+    *out_y = y < 0 ? 0 : y;
+}
+
+static void remote_composite_window(struct remote_window *win, uint8_t *fb,
+                                    uint32_t child_index)
+{
+    lv_area_t area;
+    int32_t x1;
+    int32_t y1;
+    int32_t x2;
+    int32_t y2;
+    uint32_t width;
+    uint32_t height;
+    static int composite_log_count;
+
+    if (win == NULL || !win->active || win->image == NULL ||
+        win->image_pixels == NULL || fb == NULL ||
+        win->width == 0 || win->height == 0) {
+        return;
+    }
+
+    lv_obj_get_coords(win->image, &area);
+    area.x2 = area.x1 + (int32_t)win->width - 1;
+    area.y2 = area.y1 + (int32_t)win->height - 1;
+    x1 = area.x1;
+    y1 = area.y1;
+    x2 = area.x2;
+    y2 = area.y2;
+
+    if (x2 < 0 || y2 < 0 ||
+        x1 >= (int32_t)g_fb.width ||
+        y1 >= (int32_t)g_fb.height) {
+        return;
+    }
+
+    if (x1 < 0) {
+        x1 = 0;
+    }
+
+    if (y1 < 0) {
+        y1 = 0;
+    }
+
+    if (x2 >= (int32_t)g_fb.width) {
+        x2 = (int32_t)g_fb.width - 1;
+    }
+
+    if (y2 >= (int32_t)g_fb.height) {
+        y2 = (int32_t)g_fb.height - 1;
+    }
+
+    if (x1 > x2 || y1 > y2) {
+        return;
+    }
+
+    width = (uint32_t)(x2 - x1 + 1);
+    height = (uint32_t)(y2 - y1 + 1);
+
+    for (uint32_t row = 0; row < height; row++) {
+        uint32_t src_y = (uint32_t)(y1 - area.y1) + row;
+        int32_t seg_x1[MAX_REMOTE_WINDOWS + 1];
+        int32_t seg_x2[MAX_REMOTE_WINDOWS + 1];
+        size_t seg_count = 1;
+        uint32_t child_count = lv_obj_get_child_count(g_workspace);
+
+        seg_x1[0] = x1;
+        seg_x2[0] = x2;
+
+        for (uint32_t child = child_index + 1;
+             child < child_count && seg_count > 0; child++) {
+            lv_obj_t *cover_panel = lv_obj_get_child(g_workspace, child);
+            struct remote_window *cover_win = remote_from_panel(cover_panel);
+            lv_area_t cover;
+            size_t next_count = 0;
+
+            if (cover_win == NULL ||
+                lv_obj_has_flag(cover_panel, LV_OBJ_FLAG_HIDDEN)) {
+                continue;
+            }
+
+            lv_obj_get_coords(cover_panel, &cover);
+            if ((int32_t)(y1 + (int32_t)row) < cover.y1 ||
+                (int32_t)(y1 + (int32_t)row) > cover.y2 ||
+                cover.x2 < x1 || cover.x1 > x2) {
+                continue;
+            }
+
+            for (size_t seg = 0; seg < seg_count; seg++) {
+                int32_t ox1 = cover.x1 > seg_x1[seg] ? cover.x1 : seg_x1[seg];
+                int32_t ox2 = cover.x2 < seg_x2[seg] ? cover.x2 : seg_x2[seg];
+
+                if (ox1 > ox2) {
+                    seg_x1[next_count] = seg_x1[seg];
+                    seg_x2[next_count] = seg_x2[seg];
+                    next_count++;
+                    continue;
+                }
+
+                if (seg_x1[seg] < ox1 && next_count < MAX_REMOTE_WINDOWS + 1) {
+                    seg_x1[next_count] = seg_x1[seg];
+                    seg_x2[next_count] = ox1 - 1;
+                    next_count++;
+                }
+
+                if (ox2 < seg_x2[seg] && next_count < MAX_REMOTE_WINDOWS + 1) {
+                    seg_x1[next_count] = ox2 + 1;
+                    seg_x2[next_count] = seg_x2[seg];
+                    next_count++;
+                }
+            }
+
+            seg_count = next_count;
+        }
+
+        for (size_t seg = 0; seg < seg_count; seg++) {
+            uint32_t src_x = (uint32_t)(seg_x1[seg] - area.x1);
+            uint32_t copy_width = (uint32_t)(seg_x2[seg] - seg_x1[seg] + 1);
+            const uint8_t *src = win->image_pixels + (size_t)src_y * win->stride +
+                                 (size_t)src_x * BYTES_PER_PIXEL;
+            uint8_t *dst = fb + (size_t)(y1 + (int32_t)row) * g_fb.stride +
+                           (size_t)seg_x1[seg] * BYTES_PER_PIXEL;
+
+            memcpy(dst, src, (size_t)copy_width * BYTES_PER_PIXEL);
+        }
+    }
+
+    if (composite_log_count < 16) {
+        printf("lvgl_desktop: composite window %u dst %ld,%ld %ux%u sample=%04x\n",
+               win->window_id, (long)x1, (long)y1, width, height,
+               ((uint16_t *)win->image_pixels)[0]);
+        fflush(stdout);
+        composite_log_count++;
+    }
+}
+
+static void remote_composite_surfaces(uint8_t *fb)
+{
+    if (g_workspace == NULL) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < lv_obj_get_child_count(g_workspace); i++) {
+        lv_obj_t *child = lv_obj_get_child(g_workspace, i);
+
+        for (size_t j = 0; j < MAX_REMOTE_WINDOWS; j++) {
+            if (g_windows[j].active && g_windows[j].panel == child) {
+                remote_composite_window(&g_windows[j], fb, i);
+                break;
+            }
+        }
+    }
+}
+
 static void route_pointer_to_remote(void)
 {
-    for (int i = MAX_REMOTE_WINDOWS - 1; i >= 0; i--) {
-        struct remote_window *win = &g_windows[i];
+    uint32_t child_count;
+
+    if (g_workspace == NULL) {
+        return;
+    }
+
+    child_count = lv_obj_get_child_count(g_workspace);
+    for (int32_t i = (int32_t)child_count - 1; i >= 0; i--) {
+        lv_obj_t *child = lv_obj_get_child(g_workspace, i);
+        struct remote_window *win = remote_from_panel(child);
         lv_area_t coords;
 
-        if (!win->active || win->image == NULL || win->surface == NULL) {
+        if (win == NULL || !win->active || win->image == NULL ||
+            win->surface_fd < 0 || lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
             continue;
         }
 
@@ -563,7 +1071,9 @@ static void route_pointer_to_remote(void)
             continue;
         }
 
-        remote_focus(win);
+        if (g_input.pressed && !g_input.last_pressed) {
+            remote_focus(win);
+        }
         remote_send_pointer(win, g_input.x - coords.x1, g_input.y - coords.y1,
                             g_input.pressed);
         return;
@@ -588,6 +1098,7 @@ static void pointer_read(lv_indev_t *indev, lv_indev_data_t *data)
                     g_input.y = clamp_i16(point->y, 0, (int16_t)(g_fb.height - 1));
                 }
 
+                g_input.last_pressed = g_input.pressed;
                 if ((point->flags & TOUCH_DOWN) != 0) {
                     g_input.pressed = true;
                 } else if ((point->flags & TOUCH_UP) != 0) {
@@ -627,12 +1138,20 @@ static void pointer_register(lv_display_t *disp, const char *path)
 static int keyboard_open(struct keyboard_ctx *kbd, const char *path)
 {
     kbd->fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (kbd->fd < 0 && strcmp(path, "/dev/kbd0") == 0) {
+        kbd->fd = open("/dev/kbd", O_RDONLY | O_NONBLOCK);
+        if (kbd->fd >= 0) {
+            path = "/dev/kbd";
+        }
+    }
+
     if (kbd->fd < 0) {
         fprintf(stderr, "open %s failed: %s; continue without keyboard\n",
                 path, strerror(errno));
         return -1;
     }
 
+    snprintf(kbd->path, sizeof(kbd->path), "%s", path);
     printf("lvgl_desktop: keyboard input %s\n", path);
     return 0;
 }
@@ -652,9 +1171,26 @@ static void keyboard_poll(void)
         ssize_t nread;
 
         do {
+            memset(&event, 0, sizeof(event));
             nread = read(g_keyboard.fd, &event, sizeof(event));
             if (nread == (ssize_t)sizeof(event)) {
-                remote_send_key(g_focused, event.key, event.action);
+                struct remote_window *target = g_focused != NULL ?
+                                               g_focused : remote_top_window();
+
+                if (target != NULL) {
+                    if (target != g_focused) {
+                        remote_focus(target);
+                    }
+                    remote_send_key(target, event.key, event.action);
+                } else {
+                    printf("lvgl_desktop: key %u action=%u dropped: no window\n",
+                           event.key, event.action);
+                    fflush(stdout);
+                }
+            } else if (nread > 0) {
+                printf("lvgl_desktop: short keyboard read %zd from %s\n",
+                       nread, g_keyboard.path);
+                fflush(stdout);
             }
         } while (nread == (ssize_t)sizeof(event));
     }
@@ -690,9 +1226,185 @@ static int desktop_listen(void)
         return -1;
     }
 
-    set_nonblock(fd);
     printf("lvgl_desktop: listening %s\n", LV_REMOTE_SOCKET_PATH);
     return fd;
+}
+
+static bool pending_push_client(int fd)
+{
+    bool queued = false;
+
+    pthread_mutex_lock(&g_pending_clients.lock);
+    if (g_pending_clients.count < MAX_PENDING_CLIENTS) {
+        g_pending_clients.fd[g_pending_clients.tail] = fd;
+        g_pending_clients.tail = (g_pending_clients.tail + 1U) % MAX_PENDING_CLIENTS;
+        g_pending_clients.count++;
+        queued = true;
+    }
+    pthread_mutex_unlock(&g_pending_clients.lock);
+
+    return queued;
+}
+
+static int pending_pop_client(void)
+{
+    int fd = -1;
+
+    pthread_mutex_lock(&g_pending_clients.lock);
+    if (g_pending_clients.count > 0U) {
+        fd = g_pending_clients.fd[g_pending_clients.head];
+        g_pending_clients.head = (g_pending_clients.head + 1U) % MAX_PENDING_CLIENTS;
+        g_pending_clients.count--;
+    }
+    pthread_mutex_unlock(&g_pending_clients.lock);
+
+    return fd;
+}
+
+static bool pending_push_message(size_t slot, uint32_t generation,
+                                 const struct lv_remote_msg *msg,
+                                 bool disconnect)
+{
+    bool queued = false;
+
+    pthread_mutex_lock(&g_pending_messages.lock);
+    if (g_pending_messages.count < MAX_PENDING_MESSAGES) {
+        struct pending_message *pending =
+            &g_pending_messages.msg[g_pending_messages.tail];
+
+        pending->slot = slot;
+        pending->generation = generation;
+        pending->disconnect = disconnect;
+        if (msg != NULL) {
+            pending->msg = *msg;
+        } else {
+            memset(&pending->msg, 0, sizeof(pending->msg));
+        }
+        g_pending_messages.tail =
+            (g_pending_messages.tail + 1U) % MAX_PENDING_MESSAGES;
+        g_pending_messages.count++;
+        queued = true;
+    }
+    pthread_mutex_unlock(&g_pending_messages.lock);
+
+    return queued;
+}
+
+static bool pending_pop_message(struct pending_message *out)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&g_pending_messages.lock);
+    if (g_pending_messages.count > 0U) {
+        *out = g_pending_messages.msg[g_pending_messages.head];
+        g_pending_messages.head =
+            (g_pending_messages.head + 1U) % MAX_PENDING_MESSAGES;
+        g_pending_messages.count--;
+        found = true;
+    }
+    pthread_mutex_unlock(&g_pending_messages.lock);
+
+    return found;
+}
+
+static void *remote_client_thread_main(void *arg)
+{
+    uintptr_t slot_value = (uintptr_t)arg;
+    size_t slot = (size_t)slot_value;
+    struct remote_window *win = &g_windows[slot];
+    uint32_t generation = win->generation;
+    uint32_t window_id = win->window_id;
+    int fd = win->fd;
+    unsigned int rx_log_count = 0;
+
+    for (;;) {
+        struct lv_remote_msg msg;
+
+        if (read_full(fd, &msg, sizeof(msg)) < 0) {
+            pending_push_message(slot, generation, NULL, true);
+            return NULL;
+        }
+
+        if (rx_log_count < 16U || msg.type != LV_REMOTE_MSG_COMMIT) {
+            printf("lvgl_desktop: rx slot=%zu window=%u gen=%u fd=%d type=%u pid=%u\n",
+                   slot, window_id, generation, fd, msg.type, msg.pid);
+            fflush(stdout);
+            rx_log_count++;
+        }
+
+        if (!pending_push_message(slot, generation, &msg, false)) {
+            fprintf(stderr, "remote message queue full for window %u\n",
+                    window_id);
+            pending_push_message(slot, generation, NULL, true);
+            return NULL;
+        }
+    }
+}
+
+static void remote_start_client_thread(size_t slot)
+{
+    int ret;
+    struct remote_window *win = &g_windows[slot];
+
+    ret = pthread_create(&win->rx_thread, NULL, remote_client_thread_main,
+                         (void *)(uintptr_t)slot);
+    if (ret != 0) {
+        fprintf(stderr, "pthread_create window %u rx failed: %s\n",
+                win->window_id, strerror(ret));
+        remote_destroy(win);
+        return;
+    }
+
+    win->rx_thread_started = true;
+}
+
+static void *remote_accept_thread_main(void *arg)
+{
+    int server_fd = *(int *)arg;
+
+    for (;;) {
+        int fd = accept(server_fd, NULL, NULL);
+
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            fprintf(stderr, "accept failed: %s\n", strerror(errno));
+            sleep_ms(20);
+            continue;
+        }
+
+        if (!pending_push_client(fd)) {
+            fprintf(stderr, "remote client queue full; dropping fd %d\n", fd);
+            close(fd);
+            continue;
+        }
+
+        printf("lvgl_desktop: accepted remote fd %d\n", fd);
+        fflush(stdout);
+    }
+
+    return NULL;
+}
+
+static void remote_start_accept_thread(void)
+{
+    int ret;
+
+    if (g_server_fd < 0 || g_accept_thread_started) {
+        return;
+    }
+
+    ret = pthread_create(&g_accept_thread, NULL, remote_accept_thread_main,
+                         &g_server_fd);
+    if (ret != 0) {
+        fprintf(stderr, "pthread_create accept failed: %s\n", strerror(ret));
+        return;
+    }
+
+    g_accept_thread_started = true;
+    printf("lvgl_desktop: accept thread started\n");
 }
 
 static struct remote_window *remote_alloc(int fd)
@@ -706,7 +1418,43 @@ static struct remote_window *remote_alloc(int fd)
             win->fd = fd;
             win->surface_fd = -1;
             win->window_id = g_next_window_id++;
+            win->generation = g_next_window_generation++;
+            pthread_mutex_init(&win->tx_lock, NULL);
+            pthread_cond_init(&win->tx_cond, NULL);
             snprintf(win->title, sizeof(win->title), "Remote App");
+            remote_start_tx_thread(win);
+            return win;
+        }
+    }
+
+    return NULL;
+}
+
+static struct remote_window *remote_alloc_for_pid(uint32_t pid)
+{
+    struct remote_window *win = remote_find_unbound_window();
+
+    if (win != NULL) {
+        win->pid = (pid_t)pid;
+        return win;
+    }
+
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        if (!g_windows[i].active) {
+            win = &g_windows[i];
+
+            memset(win, 0, sizeof(*win));
+            win->active = true;
+            win->fd = -1;
+            win->surface_fd = -1;
+            win->pid = (pid_t)pid;
+            win->window_id = g_next_window_id++;
+            win->generation = g_next_window_generation++;
+            pthread_mutex_init(&win->tx_lock, NULL);
+            pthread_cond_init(&win->tx_cond, NULL);
+            snprintf(win->title, sizeof(win->title), "Remote App");
+            printf("lvgl_desktop: allocated pid window %u gen=%u pid=%u\n",
+                   win->window_id, win->generation, pid);
             return win;
         }
     }
@@ -737,6 +1485,20 @@ static void remote_destroy(struct remote_window *win)
         close(win->surface_fd);
     }
 
+    if (win->path[0] != '\0') {
+        unlink(win->path);
+    }
+
+    free(win->image_pixels);
+
+    remote_tx_shutdown(win);
+    if (win->tx_thread_started) {
+        pthread_join(win->tx_thread, NULL);
+        win->tx_thread_started = false;
+    }
+    pthread_cond_destroy(&win->tx_cond);
+    pthread_mutex_destroy(&win->tx_lock);
+
     if (win->fd >= 0) {
         close(win->fd);
     }
@@ -748,21 +1510,28 @@ static void remote_destroy(struct remote_window *win)
 
 static void remote_create_ui(struct remote_window *win)
 {
-    int idx = (int)(win - g_windows);
+    int32_t panel_w = (int32_t)win->width + 8;
+    int32_t panel_h = (int32_t)win->height + 34;
+    int32_t panel_x;
+    int32_t panel_y;
     lv_obj_t *btn;
 
     if (win->panel != NULL) {
         return;
     }
 
+    remote_pick_initial_position(win, panel_w, panel_h, &panel_x, &panel_y);
+
     win->panel = lv_obj_create(g_workspace);
-    lv_obj_set_size(win->panel, win->width + 8, win->height + 34);
-    lv_obj_set_pos(win->panel, 20 + idx * 26, 22 + idx * 22);
+    lv_obj_set_size(win->panel, panel_w, panel_h);
+    lv_obj_set_pos(win->panel, panel_x, panel_y);
+    lv_obj_add_flag(win->panel, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_radius(win->panel, 6, LV_PART_MAIN);
     lv_obj_set_style_bg_color(win->panel, lv_color_hex(0xf8fafc), LV_PART_MAIN);
     lv_obj_set_style_border_width(win->panel, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(win->panel, lv_color_hex(0x64748b), LV_PART_MAIN);
     lv_obj_set_style_pad_all(win->panel, 4, LV_PART_MAIN);
+    lv_obj_add_event_cb(win->panel, window_focus_event_cb, LV_EVENT_PRESSED, NULL);
 
     win->title_bar = lv_obj_create(win->panel);
     lv_obj_set_size(win->title_bar, LV_PCT(100), 24);
@@ -803,13 +1572,23 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
 
     win->title_label = lv_label_create(win->title_bar);
-    lv_label_set_text(win->title_label, win->title);
+    lv_label_set_text_fmt(win->title_label, "%s #%u", win->title, win->window_id);
     lv_obj_set_style_text_color(win->title_label, lv_color_hex(0xffffff), LV_PART_MAIN);
     lv_obj_align(win->title_label, LV_ALIGN_LEFT_MID, 58, 0);
 
-    win->image = lv_image_create(win->panel);
+    win->image = lv_obj_create(win->panel);
     lv_obj_set_size(win->image, win->width, win->height);
     lv_obj_align(win->image, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(win->image, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(win->image, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(win->image, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(win->image, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(win->image, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(win->image, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(win->image, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(win->image, window_focus_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(win->image, remote_surface_draw_cb, LV_EVENT_DRAW_POST,
+                        NULL);
 }
 
 static int remote_attach_buffer(struct remote_window *win, const struct lv_remote_msg *msg)
@@ -830,15 +1609,7 @@ static int remote_attach_buffer(struct remote_window *win, const struct lv_remot
         return -1;
     }
 
-    win->surface = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED,
-                        win->surface_fd, 0);
-    if (win->surface == MAP_FAILED) {
-        fprintf(stderr, "mmap surface %s failed: %s\n", msg->path, strerror(errno));
-        win->surface = NULL;
-        close(win->surface_fd);
-        win->surface_fd = -1;
-        return -1;
-    }
+    win->surface = NULL;
 
     win->width = msg->width;
     win->height = msg->height;
@@ -846,23 +1617,90 @@ static int remote_attach_buffer(struct remote_window *win, const struct lv_remot
     win->format = msg->format;
     win->surface_len = len;
     snprintf(win->path, sizeof(win->path), "%s", msg->path);
+    win->image_pixels = malloc(len);
+    if (win->image_pixels == NULL) {
+        fprintf(stderr, "malloc image pixels for window %u failed\n",
+                win->window_id);
+        return -1;
+    }
+    if (read_all_at(win->surface_fd, 0, win->image_pixels, len) < 0) {
+        fprintf(stderr, "read surface %s failed: %s; start with black frame\n",
+                win->path, strerror(errno));
+        memset(win->image_pixels, 0, len);
+    }
 
     remote_create_ui(win);
 
-    memset(&win->image_dsc, 0, sizeof(win->image_dsc));
-    win->image_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    win->image_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    win->image_dsc.header.w = win->width;
-    win->image_dsc.header.h = win->height;
-    win->image_dsc.header.stride = win->stride;
-    win->image_dsc.data_size = (uint32_t)win->surface_len;
-    win->image_dsc.data = win->surface;
-
-    lv_image_set_src(win->image, &win->image_dsc);
     remote_focus(win);
-    printf("lvgl_desktop: window %u attached %ux%u stride=%u %s\n",
-           win->window_id, win->width, win->height, win->stride, win->path);
+    lv_obj_invalidate(win->image);
+    printf("lvgl_desktop: window %u attached %ux%u stride=%u pos=%ld,%ld %s\n",
+           win->window_id, win->width, win->height, win->stride,
+           (long)lv_obj_get_x(win->panel), (long)lv_obj_get_y(win->panel),
+           win->path);
     return 0;
+}
+
+static void remote_copy_surface(struct remote_window *win,
+                                const struct lv_remote_msg *msg)
+{
+    int32_t x1 = msg->x;
+    int32_t y1 = msg->y;
+    int32_t x2 = msg->x + msg->w - 1;
+    int32_t y2 = msg->y + msg->h - 1;
+    uint32_t width;
+    uint32_t height;
+    static int copy_log_count;
+
+    if (win->surface_fd < 0 || win->image_pixels == NULL ||
+        msg->w <= 0 || msg->h <= 0) {
+        return;
+    }
+
+    if (x2 < 0 || y2 < 0 ||
+        x1 >= (int32_t)win->width ||
+        y1 >= (int32_t)win->height) {
+        return;
+    }
+
+    if (x1 < 0) {
+        x1 = 0;
+    }
+
+    if (y1 < 0) {
+        y1 = 0;
+    }
+
+    if (x2 >= (int32_t)win->width) {
+        x2 = (int32_t)win->width - 1;
+    }
+
+    if (y2 >= (int32_t)win->height) {
+        y2 = (int32_t)win->height - 1;
+    }
+
+    width = (uint32_t)(x2 - x1 + 1);
+    height = (uint32_t)(y2 - y1 + 1);
+
+    for (uint32_t row = 0; row < height; row++) {
+        size_t offset = ((size_t)y1 + row) * win->stride +
+                        (size_t)x1 * BYTES_PER_PIXEL;
+
+        if (read_all_at(win->surface_fd, (off_t)offset,
+                        win->image_pixels + offset,
+                        (size_t)width * BYTES_PER_PIXEL) < 0) {
+            fprintf(stderr, "read surface row for window %u failed: %s\n",
+                    win->window_id, strerror(errno));
+            return;
+        }
+    }
+
+    if (copy_log_count < 8) {
+        printf("lvgl_desktop: copied window %u area %ld,%ld %ux%u sample=%04x\n",
+               win->window_id, (long)x1, (long)y1, width, height,
+               ((uint16_t *)win->image_pixels)[0]);
+        fflush(stdout);
+        copy_log_count++;
+    }
 }
 
 static void remote_handle_msg(struct remote_window *win,
@@ -875,7 +1713,8 @@ static void remote_handle_msg(struct remote_window *win,
 
     switch (msg->type) {
     case LV_REMOTE_MSG_HELLO:
-        printf("lvgl_desktop: window %u hello\n", win->window_id);
+        printf("lvgl_desktop: window %u hello pid=%u\n",
+               win->window_id, msg->pid);
         break;
     case LV_REMOTE_MSG_CREATE_WINDOW:
         if (msg->title[0] != '\0') {
@@ -890,6 +1729,7 @@ static void remote_handle_msg(struct remote_window *win,
         if (msg->height > 0) {
             win->height = msg->height;
         }
+        win->topmost = (msg->flags & LV_REMOTE_WINDOW_TOPMOST) != 0U;
         printf("lvgl_desktop: window %u create '%s' %ux%u pid=%ld\n",
                win->window_id, win->title, win->width, win->height,
                (long)win->pid);
@@ -901,6 +1741,7 @@ static void remote_handle_msg(struct remote_window *win,
         break;
     case LV_REMOTE_MSG_COMMIT:
         if (win->image != NULL) {
+            remote_copy_surface(win, msg);
             lv_obj_invalidate(win->image);
         }
         break;
@@ -914,83 +1755,87 @@ static void remote_handle_msg(struct remote_window *win,
     }
 }
 
-static void remote_poll_client(struct remote_window *win)
+static void remote_process_messages(void)
 {
-    struct pollfd pfd;
-    ssize_t nread;
+    static unsigned int dispatch_log_count;
 
-    pfd.fd = win->fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    if (poll(&pfd, 1, 0) <= 0) {
-        return;
-    }
+    for (;;) {
+        struct pending_message pending;
+        struct remote_window *win;
 
-    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        remote_destroy(win);
-        return;
-    }
-
-    if ((pfd.revents & POLLIN) == 0) {
-        return;
-    }
-
-    nread = read(win->fd, win->rxbuf + win->rx_len,
-                 sizeof(win->rxbuf) - win->rx_len);
-    if (nread < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (!pending_pop_message(&pending)) {
             return;
         }
 
-        remote_destroy(win);
-        return;
-    }
+        if (pending.slot >= MAX_REMOTE_WINDOWS) {
+            continue;
+        }
 
-    if (nread == 0) {
-        remote_destroy(win);
-        return;
-    }
+        win = &g_windows[pending.slot];
+        if (!win->active || win->generation != pending.generation) {
+            continue;
+        }
 
-    win->rx_len += (size_t)nread;
-    if (win->rx_len == sizeof(struct lv_remote_msg)) {
-        struct lv_remote_msg msg;
+        if (pending.disconnect) {
+            if (win->pid == 0) {
+                remote_destroy(win);
+            }
+            continue;
+        }
 
-        memcpy(&msg, win->rxbuf, sizeof(msg));
-        win->rx_len = 0;
-        remote_handle_msg(win, &msg);
+        if (pending.msg.pid != 0U) {
+            struct remote_window *pid_win =
+                remote_find_by_pid(pending.msg.pid);
+
+            if (pid_win == NULL &&
+                (pending.msg.type == LV_REMOTE_MSG_HELLO ||
+                 pending.msg.type == LV_REMOTE_MSG_CREATE_WINDOW ||
+                 pending.msg.type == LV_REMOTE_MSG_ATTACH_BUFFER)) {
+                pid_win = remote_alloc_for_pid(pending.msg.pid);
+            }
+
+            if (pid_win != NULL) {
+                win = pid_win;
+            }
+        }
+
+        if (dispatch_log_count < 64U ||
+            pending.msg.type != LV_REMOTE_MSG_COMMIT) {
+            printf("lvgl_desktop: dispatch slot=%zu -> window=%u gen=%u type=%u pid=%u\n",
+                   pending.slot, win->window_id, win->generation,
+                   pending.msg.type, pending.msg.pid);
+            fflush(stdout);
+            dispatch_log_count++;
+        }
+        remote_handle_msg(win, &pending.msg);
     }
 }
 
 static void remote_accept_clients(void)
 {
-    struct pollfd pfd;
     int fd;
-    struct remote_window *win;
 
-    pfd.fd = g_server_fd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    if (poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0) {
-        return;
-    }
+    for (;;) {
+        struct remote_window *win;
+        size_t slot;
 
-    fd = accept(g_server_fd, NULL, NULL);
-    if (fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            fprintf(stderr, "accept failed: %s\n", strerror(errno));
+        fd = pending_pop_client();
+        if (fd < 0) {
+            return;
         }
-        return;
-    }
 
-    set_nonblock(fd);
-    win = remote_alloc(fd);
-    if (win == NULL) {
-        fprintf(stderr, "too many remote windows\n");
-        close(fd);
-        return;
-    }
+        win = remote_alloc(fd);
+        if (win == NULL) {
+            fprintf(stderr, "too many remote windows\n");
+            close(fd);
+            continue;
+        }
 
-    printf("lvgl_desktop: accepted client window %u\n", win->window_id);
+        slot = (size_t)(win - g_windows);
+        printf("lvgl_desktop: registered client slot=%zu window=%u gen=%u fd=%d\n",
+               slot, win->window_id, win->generation, fd);
+        remote_start_client_thread(slot);
+    }
 }
 
 static void remote_poll(void)
@@ -999,11 +1844,7 @@ static void remote_poll(void)
         remote_accept_clients();
     }
 
-    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
-        if (g_windows[i].active) {
-            remote_poll_client(&g_windows[i]);
-        }
-    }
+    remote_process_messages();
 }
 
 static void ui_create(void)
@@ -1101,17 +1942,25 @@ int main(int argc, char **argv)
     pointer_register(disp, inputdev);
     keyboard_open(&g_keyboard, kbddev);
     ui_create();
+    lv_obj_invalidate(lv_screen_active());
 
     g_server_fd = desktop_listen();
     if (g_server_fd < 0) {
         fprintf(stderr, "lvgl_desktop: remote apps disabled\n");
+    } else {
+        remote_start_accept_thread();
     }
 
     for (;;) {
-        uint32_t idle = lv_timer_handler();
+        uint32_t idle;
 
         keyboard_poll();
         remote_poll();
+        if (remote_has_windows()) {
+            lv_obj_invalidate(lv_screen_active());
+        }
+
+        idle = lv_timer_handler();
         sleep_ms(idle == 0 ? 5U : idle > 10U ? 10U : idle);
     }
 
