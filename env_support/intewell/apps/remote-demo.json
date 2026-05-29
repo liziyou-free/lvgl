@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "app_id": "remote-demo",
+  "name": "Remote Demo",
+  "type": "remote-lvgl",
+  "exec": "/root/lvgl_remote_demo",
+  "cwd": "/root",
+  "icon": "demo",
+  "categories": [
+    "demo"
+  ],
+  "startup_notify": true,
+  "single_instance": false,
+  "topmost": false,
+  "autostart": false,
+  "hidden": false
+}

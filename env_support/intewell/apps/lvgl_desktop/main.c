@@ -3,8 +3,11 @@
 #include "lvgl/lvgl.h"
 #include "fb_compat.h"
 #include "lv_remote.h"
+#include "cJSON.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -19,20 +22,25 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_FBDEV "/dev/fb0"
 #define DEFAULT_INPUTDEV "/dev/input0"
 #define DEFAULT_KBDDEV "/dev/kbd0"
+#define DEFAULT_APPDIR "/etc/apps"
 #define DEFAULT_WIDTH 800
 #define DEFAULT_HEIGHT 480
 #define BYTES_PER_PIXEL 2
 #define FB_BUFFER_COUNT 2
 #define MAX_REMOTE_WINDOWS 8
+#define MAX_APPS 16
 #define MAX_PENDING_CLIENTS 16
 #define MAX_PENDING_MESSAGES 64
 #define KEYBOARD_PRESS 1
+#define LAUNCHER_WIDTH 180
+#define LAUNCHER_BUTTON_HEIGHT 36
 
 #define TOUCH_POS_VALID 0x02
 #define TOUCH_DOWN 0x04
@@ -89,6 +97,25 @@ struct keyboard_ctx {
     char path[64];
 };
 
+struct app_manifest {
+    bool loaded;
+    int manifest_version;
+    char manifest_path[128];
+    char app_id[64];
+    char name[64];
+    char type[32];
+    char exec[128];
+    char cwd[128];
+    char icon[32];
+    bool startup_notify;
+    bool single_instance;
+    bool topmost;
+    bool autostart;
+    bool hidden;
+    lv_obj_t *button;
+    pid_t running_pid;
+};
+
 struct remote_window {
     bool active;
     bool focused;
@@ -138,11 +165,15 @@ static struct input_ctx g_input = {
 static struct keyboard_ctx g_keyboard = {
     .fd = -1,
 };
+static struct app_manifest g_apps[MAX_APPS];
+static size_t g_app_count;
+static char g_app_dir[128] = DEFAULT_APPDIR;
 static struct remote_window g_windows[MAX_REMOTE_WINDOWS];
 static struct remote_window *g_focused;
 static int g_server_fd = -1;
 static uint32_t g_next_window_id = 1;
 static uint32_t g_next_window_generation = 1;
+static lv_obj_t *g_launcher;
 static lv_obj_t *g_workspace;
 static lv_obj_t *g_status;
 
@@ -193,6 +224,7 @@ static bool g_accept_thread_started;
 static void remote_destroy(struct remote_window *win);
 static void remote_composite_surfaces(uint8_t *fb);
 static void sleep_ms(uint32_t ms);
+static void ui_rebuild_launcher(void);
 
 static struct remote_window *remote_from_panel(lv_obj_t *panel)
 {
@@ -325,6 +357,170 @@ static struct remote_window *remote_find_unbound_window(void)
     return NULL;
 }
 
+static bool app_manifest_load_file(const char *path, struct app_manifest *app)
+{
+    char json[4096];
+    cJSON *root = NULL;
+    cJSON *item;
+    int fd;
+    ssize_t nread;
+
+    memset(app, 0, sizeof(*app));
+    snprintf(app->manifest_path, sizeof(app->manifest_path), "%s", path);
+    app->manifest_path[sizeof(app->manifest_path) - 1U] = '\0';
+    app->startup_notify = true;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    nread = read(fd, json, sizeof(json) - 1U);
+    close(fd);
+    if (nread <= 0) {
+        return false;
+    }
+
+    json[nread] = '\0';
+    root = cJSON_Parse(json);
+    if (root == NULL) {
+        return false;
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "manifest_version");
+    if (!cJSON_IsNumber(item)) {
+        goto fail;
+    }
+    app->manifest_version = item->valueint;
+    if (app->manifest_version != 1) {
+        goto fail;
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "app_id");
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        goto fail;
+    }
+    snprintf(app->app_id, sizeof(app->app_id), "%s", item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "name");
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        goto fail;
+    }
+    snprintf(app->name, sizeof(app->name), "%s", item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "type");
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        goto fail;
+    }
+    snprintf(app->type, sizeof(app->type), "%s", item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "exec");
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        goto fail;
+    }
+    snprintf(app->exec, sizeof(app->exec), "%s", item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "cwd");
+    if (cJSON_IsString(item) && item->valuestring != NULL) {
+        snprintf(app->cwd, sizeof(app->cwd), "%s", item->valuestring);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "icon");
+    if (cJSON_IsString(item) && item->valuestring != NULL) {
+        snprintf(app->icon, sizeof(app->icon), "%s", item->valuestring);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "startup_notify");
+    if (cJSON_IsBool(item)) {
+        app->startup_notify = cJSON_IsTrue(item);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "single_instance");
+    if (cJSON_IsBool(item)) {
+        app->single_instance = cJSON_IsTrue(item);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "topmost");
+    if (cJSON_IsBool(item)) {
+        app->topmost = cJSON_IsTrue(item);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "autostart");
+    if (cJSON_IsBool(item)) {
+        app->autostart = cJSON_IsTrue(item);
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "hidden");
+    if (cJSON_IsBool(item)) {
+        app->hidden = cJSON_IsTrue(item);
+    }
+
+    app->loaded = true;
+    cJSON_Delete(root);
+    return true;
+
+fail:
+    cJSON_Delete(root);
+    return false;
+}
+
+static bool app_manifest_duplicate_id(const char *app_id)
+{
+    for (size_t i = 0; i < g_app_count; i++) {
+        if (strcmp(g_apps[i].app_id, app_id) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void app_registry_load(const char *app_dir)
+{
+    DIR *dir;
+    struct dirent *entry;
+
+    g_app_count = 0;
+    memset(g_apps, 0, sizeof(g_apps));
+
+    dir = opendir(app_dir);
+    if (dir == NULL) {
+        fprintf(stderr, "open app dir %s failed: %s\n",
+                app_dir, strerror(errno));
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        struct app_manifest app;
+        char path[256];
+        size_t len;
+
+        len = strlen(entry->d_name);
+        if (len < 6U || strcmp(entry->d_name + len - 5U, ".json") != 0) {
+            continue;
+        }
+
+        if (g_app_count >= MAX_APPS) {
+            break;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", app_dir, entry->d_name);
+        if (!app_manifest_load_file(path, &app)) {
+            fprintf(stderr, "ignore invalid manifest %s\n", path);
+            continue;
+        }
+
+        if (app_manifest_duplicate_id(app.app_id)) {
+            fprintf(stderr, "ignore duplicate app id %s\n", app.app_id);
+            continue;
+        }
+
+        g_apps[g_app_count++] = app;
+    }
+
+    closedir(dir);
+}
+
 static int read_all_at(int fd, off_t offset, void *buf, size_t len)
 {
     uint8_t *p = buf;
@@ -381,6 +577,74 @@ static int read_full(int fd, void *buf, size_t len)
     }
 
     return 0;
+}
+
+static void app_mark_pid_exited(pid_t pid)
+{
+    for (size_t i = 0; i < g_app_count; i++) {
+        if (g_apps[i].running_pid == pid) {
+            g_apps[i].running_pid = 0;
+            return;
+        }
+    }
+}
+
+static void app_reap_children(void)
+{
+    for (;;) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid <= 0) {
+            return;
+        }
+
+        app_mark_pid_exited(pid);
+    }
+}
+
+static int app_launch(struct app_manifest *app)
+{
+    pid_t pid;
+
+    if (app == NULL || !app->loaded || app->exec[0] == '\0') {
+        return -1;
+    }
+
+    if (app->single_instance && app->running_pid > 0) {
+        return 0;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "launch %s fork failed: %s\n",
+                app->app_id, strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        const char *cwd = app->cwd[0] != '\0' ? app->cwd : "/";
+
+        chdir(cwd);
+        execl("/bin/sh", "sh", "-c", app->exec, (char *)NULL);
+        _exit(127);
+    }
+
+    app->running_pid = pid;
+    printf("lvgl_desktop: launched app %s pid=%ld\n",
+           app->app_id, (long)pid);
+    return 0;
+}
+
+static void launcher_button_event_cb(lv_event_t *event)
+{
+    struct app_manifest *app = lv_event_get_user_data(event);
+
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    (void)app_launch(app);
 }
 
 static struct remote_window *remote_top_window(void)
@@ -1847,6 +2111,59 @@ static void remote_poll(void)
     remote_process_messages();
 }
 
+static void ui_rebuild_launcher(void)
+{
+    bool added = false;
+
+    if (g_launcher == NULL) {
+        return;
+    }
+
+    while (lv_obj_get_child_count(g_launcher) > 0U) {
+        lv_obj_delete(lv_obj_get_child(g_launcher, 0));
+    }
+
+    for (size_t i = 0; i < g_app_count; i++) {
+        lv_obj_t *btn;
+        lv_obj_t *label;
+        struct app_manifest *app = &g_apps[i];
+
+        if (app->hidden) {
+            continue;
+        }
+
+        btn = lv_button_create(g_launcher);
+        app->button = btn;
+        lv_obj_set_size(btn, LV_PCT(100), LAUNCHER_BUTTON_HEIGHT);
+        lv_obj_add_event_cb(btn, launcher_button_event_cb, LV_EVENT_CLICKED, app);
+        added = true;
+
+        label = lv_label_create(btn);
+        lv_label_set_text(label, app->name);
+        lv_obj_center(label);
+    }
+
+    if (!added) {
+        lv_obj_t *label = lv_label_create(g_launcher);
+        char text[192];
+
+        snprintf(text, sizeof(text), "No apps\n%s", g_app_dir);
+        lv_label_set_text(label, text);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xcbd5e1), LV_PART_MAIN);
+    }
+}
+
+static void app_registry_autostart(void)
+{
+    for (size_t i = 0; i < g_app_count; i++) {
+        if (g_apps[i].autostart) {
+            (void)app_launch(&g_apps[i]);
+        }
+    }
+}
+
 static void ui_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -1876,9 +2193,21 @@ static void ui_create(void)
     lv_obj_set_style_text_color(g_status, lv_color_hex(0x9ca3af), LV_PART_MAIN);
     lv_obj_align(g_status, LV_ALIGN_RIGHT_MID, 0, 0);
 
+    g_launcher = lv_obj_create(scr);
+    lv_obj_set_size(g_launcher, LAUNCHER_WIDTH, g_fb.height - 40);
+    lv_obj_align(g_launcher, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_radius(g_launcher, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_launcher, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_launcher, lv_color_hex(0x1e293b), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_launcher, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(g_launcher, 6, LV_PART_MAIN);
+    lv_obj_set_flex_flow(g_launcher, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_launcher, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
     g_workspace = lv_obj_create(scr);
-    lv_obj_set_size(g_workspace, LV_PCT(100), g_fb.height - 40);
-    lv_obj_align(g_workspace, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(g_workspace, g_fb.width - LAUNCHER_WIDTH, g_fb.height - 40);
+    lv_obj_align(g_workspace, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_radius(g_workspace, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(g_workspace, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(g_workspace, lv_color_hex(0x334155), LV_PART_MAIN);
@@ -1886,11 +2215,13 @@ static void ui_create(void)
 }
 
 static void parse_args(int argc, char **argv, const char **fbdev,
-                       const char **inputdev, const char **kbddev)
+                       const char **inputdev, const char **kbddev,
+                       const char **appdir)
 {
     *fbdev = DEFAULT_FBDEV;
     *inputdev = DEFAULT_INPUTDEV;
     *kbddev = DEFAULT_KBDDEV;
+    *appdir = DEFAULT_APPDIR;
 
     if (argc > 1) {
         *fbdev = argv[1];
@@ -1903,6 +2234,10 @@ static void parse_args(int argc, char **argv, const char **fbdev,
     if (argc > 3) {
         *kbddev = argv[3];
     }
+
+    if (argc > 4) {
+        *appdir = argv[4];
+    }
 }
 
 int main(int argc, char **argv)
@@ -1910,12 +2245,15 @@ int main(int argc, char **argv)
     const char *fbdev;
     const char *inputdev;
     const char *kbddev;
+    const char *appdir;
     lv_display_t *disp;
     void *draw_buf1;
     void *draw_buf2;
 
-    parse_args(argc, argv, &fbdev, &inputdev, &kbddev);
-    printf("lvgl_desktop: fb=%s input=%s kbd=%s\n", fbdev, inputdev, kbddev);
+    parse_args(argc, argv, &fbdev, &inputdev, &kbddev, &appdir);
+    snprintf(g_app_dir, sizeof(g_app_dir), "%s", appdir);
+    printf("lvgl_desktop: fb=%s input=%s kbd=%s apps=%s\n",
+           fbdev, inputdev, kbddev, g_app_dir);
 
     if (fb_open(&g_fb, fbdev) < 0) {
         return 1;
@@ -1942,6 +2280,9 @@ int main(int argc, char **argv)
     pointer_register(disp, inputdev);
     keyboard_open(&g_keyboard, kbddev);
     ui_create();
+    app_registry_load(g_app_dir);
+    ui_rebuild_launcher();
+    app_registry_autostart();
     lv_obj_invalidate(lv_screen_active());
 
     g_server_fd = desktop_listen();
@@ -1954,6 +2295,7 @@ int main(int argc, char **argv)
     for (;;) {
         uint32_t idle;
 
+        app_reap_children();
         keyboard_poll();
         remote_poll();
         if (remote_has_windows()) {

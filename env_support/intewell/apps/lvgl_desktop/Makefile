@@ -8,6 +8,7 @@ TFTP_ROOT ?= /home/freedomli/Development/tftp-server-root
 CFLAGS := -O2 -g -Wall -Wextra $(filter-out -O0 -O1 -O2 -O3 -Os -Og,$(CFLAGS))
 CFLAGS += -std=c99 -D_GNU_SOURCE -DLV_DISABLE_API_MAPPING -DLV_CONF_INCLUDE_SIMPLE=1 -DLV_CONF_PATH=\"lv_conf.h\"
 CFLAGS += -I. -I$(LVGL_DIR) -I$(LVGL_DIR)/include -I$(LVGL_DIR)/env_support/intewell
+CFLAGS += -I$(LVGL_DIR)/env_support/intewell/third_party/cjson
 LDFLAGS ?= -static
 LDLIBS ?= -lm -pthread
 
@@ -58,7 +59,7 @@ LVGL_SRCS := \
 	$(LVGL_DIR)/src/widgets/property/lv_image_properties.c
 
 LVGL_OBJS := $(patsubst $(LVGL_DIR)/%.c,build/lvgl/%.o,$(LVGL_SRCS))
-OBJS := build/main.o $(LVGL_OBJS)
+OBJS := build/main.o build/cjson/cJSON.o $(LVGL_OBJS)
 
 .PHONY: all clean install
 
@@ -68,6 +69,11 @@ $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 build/main.o: main.c lv_conf.h fb_compat.h $(LVGL_DIR)/env_support/intewell/lv_remote.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/cjson/cJSON.o: $(LVGL_DIR)/env_support/intewell/third_party/cjson/cJSON.c \
+                     $(LVGL_DIR)/env_support/intewell/third_party/cjson/cJSON.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 

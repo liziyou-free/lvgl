@@ -356,3 +356,18 @@ Any protocol extension should start here.
 2. Add optional protocol-level ACK or sequence tracing for input events.
 3. Consider replacing stream control transport with a more explicit message channel if local stream semantics remain unreliable.
 4. Consider a dedicated terminal widget or more efficient text view if terminal output volume becomes a bottleneck.
+
+## App Registry Direction
+
+The first app registry format is defined in:
+
+- `env_support/intewell/LVGL_APP_MANIFEST_V1.md`
+
+Recommended target-side discovery directory:
+
+- `/etc/apps`
+
+Example manifests already exist in the repository:
+
+- `env_support/intewell/apps/terminal.json`
+- `env_support/intewell/apps/remote-demo.json`

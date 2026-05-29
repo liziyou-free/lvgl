@@ -1,0 +1,18 @@
+{
+  "manifest_version": 1,
+  "app_id": "terminal",
+  "name": "Terminal",
+  "type": "remote-lvgl",
+  "exec": "/root/lvgl_remote_terminal",
+  "cwd": "/",
+  "icon": "terminal",
+  "categories": [
+    "system",
+    "development"
+  ],
+  "startup_notify": true,
+  "single_instance": false,
+  "topmost": false,
+  "autostart": false,
+  "hidden": false
+}
