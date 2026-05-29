@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "app_id": "video-player",
+  "name": "Video Player",
+  "type": "remote-lvgl",
+  "exec": "/root/lvgl_remote_video",
+  "cwd": "/root",
+  "icon": "video",
+  "categories": [
+    "media"
+  ],
+  "startup_notify": true,
+  "single_instance": false,
+  "topmost": false,
+  "autostart": false,
+  "hidden": false
+}
