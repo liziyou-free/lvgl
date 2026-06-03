@@ -27,6 +27,7 @@ enum lv_remote_msg_type {
     LV_REMOTE_MSG_INPUT_KEY,
     LV_REMOTE_MSG_CLOSE_WINDOW,
     LV_REMOTE_MSG_TERMINATE,
+    LV_REMOTE_MSG_CONFIGURE_WINDOW,
 };
 
 enum lv_remote_key_action {

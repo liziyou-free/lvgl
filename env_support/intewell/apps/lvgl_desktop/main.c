@@ -41,6 +41,13 @@
 #define KEYBOARD_PRESS 1
 #define LAUNCHER_WIDTH 180
 #define LAUNCHER_BUTTON_HEIGHT 36
+#define WINDOW_FRAME_PAD 4
+#define WINDOW_TITLE_HEIGHT 24
+#define WINDOW_EXTRA_W (WINDOW_FRAME_PAD * 2)
+#define WINDOW_EXTRA_H (WINDOW_FRAME_PAD * 2 + WINDOW_TITLE_HEIGHT + 2)
+#define WINDOW_RESIZE_HANDLE 16
+#define WINDOW_MIN_CONTENT_W 160
+#define WINDOW_MIN_CONTENT_H 120
 
 #define TOUCH_POS_VALID 0x02
 #define TOUCH_DOWN 0x04
@@ -124,8 +131,11 @@ struct remote_window {
     int surface_fd;
     uint32_t window_id;
     uint32_t generation;
+    uint32_t tx_serial;
     uint32_t width;
     uint32_t height;
+    uint32_t pending_width;
+    uint32_t pending_height;
     uint32_t stride;
     uint32_t format;
     pid_t pid;
@@ -143,6 +153,7 @@ struct remote_window {
     lv_obj_t *zoom_button;
     lv_obj_t *title_label;
     lv_obj_t *image;
+    lv_obj_t *resize_handle;
     pthread_t rx_thread;
     bool rx_thread_started;
     pthread_t tx_thread;
@@ -188,6 +199,17 @@ struct drag_state {
 
 static struct drag_state g_drag;
 
+struct resize_state {
+    struct remote_window *win;
+    int16_t start_x;
+    int16_t start_y;
+    uint32_t start_w;
+    uint32_t start_h;
+    bool active;
+};
+
+static struct resize_state g_resize;
+
 struct pending_clients {
     pthread_mutex_t lock;
     int fd[MAX_PENDING_CLIENTS];
@@ -230,21 +252,6 @@ static struct remote_window *remote_from_panel(lv_obj_t *panel)
 {
     for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
         if (g_windows[i].active && g_windows[i].panel == panel) {
-            return &g_windows[i];
-        }
-    }
-
-    return NULL;
-}
-
-static struct remote_window *remote_find_by_pid(uint32_t pid)
-{
-    if (pid == 0U) {
-        return NULL;
-    }
-
-    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
-        if (g_windows[i].active && g_windows[i].pid == (pid_t)pid) {
             return &g_windows[i];
         }
     }
@@ -343,18 +350,6 @@ static void remote_start_tx_thread(struct remote_window *win)
     }
 
     win->tx_thread_started = true;
-}
-
-static struct remote_window *remote_find_unbound_window(void)
-{
-    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
-        if (g_windows[i].active && g_windows[i].pid == 0 &&
-            g_windows[i].panel == NULL) {
-            return &g_windows[i];
-        }
-    }
-
-    return NULL;
 }
 
 static bool app_manifest_load_file(const char *path, struct app_manifest *app)
@@ -958,6 +953,61 @@ static void remote_send_key(struct remote_window *win, uint32_t key, uint32_t ac
     }
 }
 
+static int32_t remote_panel_width(uint32_t content_w)
+{
+    return (int32_t)content_w + WINDOW_EXTRA_W;
+}
+
+static int32_t remote_panel_height(uint32_t content_h)
+{
+    return (int32_t)content_h + WINDOW_EXTRA_H;
+}
+
+static void remote_resize_ui(struct remote_window *win, uint32_t content_w,
+                             uint32_t content_h)
+{
+    if (win == NULL || win->panel == NULL) {
+        return;
+    }
+
+    lv_obj_set_size(win->panel, remote_panel_width(content_w),
+                    remote_panel_height(content_h));
+    if (win->image != NULL) {
+        lv_obj_set_size(win->image, content_w, content_h);
+        lv_obj_align(win->image, LV_ALIGN_BOTTOM_MID, 0, 0);
+    }
+    if (win->resize_handle != NULL) {
+        lv_obj_align(win->resize_handle, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    }
+}
+
+static void remote_send_configure(struct remote_window *win, uint32_t width,
+                                  uint32_t height)
+{
+    struct lv_remote_msg msg;
+
+    if (win == NULL || !win->active) {
+        return;
+    }
+
+    lv_remote_msg_init(&msg, LV_REMOTE_MSG_CONFIGURE_WINDOW);
+    msg.serial = ++win->tx_serial;
+    msg.window_id = win->window_id;
+    msg.pid = (uint32_t)win->pid;
+    msg.width = width;
+    msg.height = height;
+    if (!remote_tx_enqueue(win, &msg)) {
+        fprintf(stderr, "queue configure to window %u failed\n",
+                win->window_id);
+        return;
+    }
+
+    win->pending_width = width;
+    win->pending_height = height;
+    printf("lvgl_desktop: configure window %u %ux%u serial=%u\n",
+           win->window_id, width, height, msg.serial);
+}
+
 static void remote_request_close(struct remote_window *win)
 {
     struct lv_remote_msg msg;
@@ -1034,7 +1084,7 @@ static struct remote_window *remote_from_obj(lv_obj_t *obj)
         if (obj == win->panel || obj == win->title_bar ||
             obj == win->close_button || obj == win->min_button ||
             obj == win->zoom_button || obj == win->title_label ||
-            obj == win->image) {
+            obj == win->image || obj == win->resize_handle) {
             return win;
         }
     }
@@ -1111,6 +1161,69 @@ static void window_drag_event_cb(lv_event_t *event)
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
         if (g_drag.win == win) {
             memset(&g_drag, 0, sizeof(g_drag));
+        }
+    }
+}
+
+static void window_resize_event_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *target = lv_event_get_target(event);
+    struct remote_window *win = remote_from_obj(target);
+
+    if (win == NULL || win->panel == NULL) {
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSED) {
+        remote_focus(win);
+        g_resize.win = win;
+        g_resize.start_x = g_input.x;
+        g_resize.start_y = g_input.y;
+        g_resize.start_w = (uint32_t)lv_obj_get_width(win->image);
+        g_resize.start_h = (uint32_t)lv_obj_get_height(win->image);
+        g_resize.active = true;
+    } else if (code == LV_EVENT_PRESSING && g_resize.active &&
+               g_resize.win == win) {
+        int32_t next_w = (int32_t)g_resize.start_w +
+                         (int32_t)g_input.x - g_resize.start_x;
+        int32_t next_h = (int32_t)g_resize.start_h +
+                         (int32_t)g_input.y - g_resize.start_y;
+        int32_t max_w = (int32_t)lv_obj_get_width(g_workspace) -
+                        lv_obj_get_x(win->panel) - WINDOW_EXTRA_W;
+        int32_t max_h = (int32_t)lv_obj_get_height(g_workspace) -
+                        lv_obj_get_y(win->panel) - WINDOW_EXTRA_H;
+
+        if (max_w < WINDOW_MIN_CONTENT_W) {
+            max_w = WINDOW_MIN_CONTENT_W;
+        }
+
+        if (max_h < WINDOW_MIN_CONTENT_H) {
+            max_h = WINDOW_MIN_CONTENT_H;
+        }
+
+        if (next_w < WINDOW_MIN_CONTENT_W) {
+            next_w = WINDOW_MIN_CONTENT_W;
+        } else if (next_w > max_w) {
+            next_w = max_w;
+        }
+
+        if (next_h < WINDOW_MIN_CONTENT_H) {
+            next_h = WINDOW_MIN_CONTENT_H;
+        } else if (next_h > max_h) {
+            next_h = max_h;
+        }
+
+        remote_resize_ui(win, (uint32_t)next_w, (uint32_t)next_h);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (g_resize.win == win) {
+            uint32_t next_w = (uint32_t)lv_obj_get_width(win->image);
+            uint32_t next_h = (uint32_t)lv_obj_get_height(win->image);
+
+            if (next_w != win->width || next_h != win->height) {
+                remote_send_configure(win, next_w, next_h);
+            }
+            memset(&g_resize, 0, sizeof(g_resize));
         }
     }
 }
@@ -1327,6 +1440,10 @@ static void route_pointer_to_remote(void)
         if (win == NULL || !win->active || win->image == NULL ||
             win->surface_fd < 0 || lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
             continue;
+        }
+
+        if (g_drag.active || g_resize.active) {
+            return;
         }
 
         lv_obj_get_coords(win->image, &coords);
@@ -1694,38 +1811,6 @@ static struct remote_window *remote_alloc(int fd)
     return NULL;
 }
 
-static struct remote_window *remote_alloc_for_pid(uint32_t pid)
-{
-    struct remote_window *win = remote_find_unbound_window();
-
-    if (win != NULL) {
-        win->pid = (pid_t)pid;
-        return win;
-    }
-
-    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
-        if (!g_windows[i].active) {
-            win = &g_windows[i];
-
-            memset(win, 0, sizeof(*win));
-            win->active = true;
-            win->fd = -1;
-            win->surface_fd = -1;
-            win->pid = (pid_t)pid;
-            win->window_id = g_next_window_id++;
-            win->generation = g_next_window_generation++;
-            pthread_mutex_init(&win->tx_lock, NULL);
-            pthread_cond_init(&win->tx_cond, NULL);
-            snprintf(win->title, sizeof(win->title), "Remote App");
-            printf("lvgl_desktop: allocated pid window %u gen=%u pid=%u\n",
-                   win->window_id, win->generation, pid);
-            return win;
-        }
-    }
-
-    return NULL;
-}
-
 static void remote_destroy(struct remote_window *win)
 {
     if (win == NULL || !win->active) {
@@ -1774,8 +1859,8 @@ static void remote_destroy(struct remote_window *win)
 
 static void remote_create_ui(struct remote_window *win)
 {
-    int32_t panel_w = (int32_t)win->width + 8;
-    int32_t panel_h = (int32_t)win->height + 34;
+    int32_t panel_w = remote_panel_width(win->width);
+    int32_t panel_h = remote_panel_height(win->height);
     int32_t panel_x;
     int32_t panel_y;
     lv_obj_t *btn;
@@ -1853,11 +1938,27 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_add_event_cb(win->image, window_focus_event_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(win->image, remote_surface_draw_cb, LV_EVENT_DRAW_POST,
                         NULL);
+
+    win->resize_handle = lv_obj_create(win->panel);
+    lv_obj_set_size(win->resize_handle, WINDOW_RESIZE_HANDLE, WINDOW_RESIZE_HANDLE);
+    lv_obj_align(win->resize_handle, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_flag(win->resize_handle, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(win->resize_handle, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(win->resize_handle, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(win->resize_handle, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(win->resize_handle, lv_color_hex(0x94a3b8), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(win->resize_handle, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_PRESS_LOST, NULL);
 }
 
 static int remote_attach_buffer(struct remote_window *win, const struct lv_remote_msg *msg)
 {
     size_t len;
+    uint8_t *pixels;
+    int fd;
 
     if (msg->format != LV_REMOTE_FORMAT_RGB565 || msg->width == 0 ||
         msg->height == 0 || msg->stride < msg->width * BYTES_PER_PIXEL) {
@@ -1867,33 +1968,48 @@ static int remote_attach_buffer(struct remote_window *win, const struct lv_remot
     }
 
     len = (size_t)msg->stride * msg->height;
-    win->surface_fd = open(msg->path, O_RDWR);
-    if (win->surface_fd < 0) {
+    fd = open(msg->path, O_RDWR);
+    if (fd < 0) {
         fprintf(stderr, "open surface %s failed: %s\n", msg->path, strerror(errno));
         return -1;
     }
 
-    win->surface = NULL;
-
-    win->width = msg->width;
-    win->height = msg->height;
-    win->stride = msg->stride;
-    win->format = msg->format;
-    win->surface_len = len;
-    snprintf(win->path, sizeof(win->path), "%s", msg->path);
-    win->image_pixels = malloc(len);
-    if (win->image_pixels == NULL) {
+    pixels = malloc(len);
+    if (pixels == NULL) {
+        close(fd);
         fprintf(stderr, "malloc image pixels for window %u failed\n",
                 win->window_id);
         return -1;
     }
-    if (read_all_at(win->surface_fd, 0, win->image_pixels, len) < 0) {
+
+    if (read_all_at(fd, 0, pixels, len) < 0) {
         fprintf(stderr, "read surface %s failed: %s; start with black frame\n",
-                win->path, strerror(errno));
-        memset(win->image_pixels, 0, len);
+                msg->path, strerror(errno));
+        memset(pixels, 0, len);
     }
 
+    if (win->surface != NULL) {
+        munmap(win->surface, win->surface_len);
+        win->surface = NULL;
+    }
+    if (win->surface_fd >= 0) {
+        close(win->surface_fd);
+    }
+    free(win->image_pixels);
+
+    win->surface_fd = fd;
+    win->width = msg->width;
+    win->height = msg->height;
+    win->pending_width = 0;
+    win->pending_height = 0;
+    win->stride = msg->stride;
+    win->format = msg->format;
+    win->surface_len = len;
+    snprintf(win->path, sizeof(win->path), "%s", msg->path);
+    win->image_pixels = pixels;
+
     remote_create_ui(win);
+    remote_resize_ui(win, win->width, win->height);
 
     remote_focus(win);
     lv_obj_invalidate(win->image);
@@ -2041,26 +2157,17 @@ static void remote_process_messages(void)
         }
 
         if (pending.disconnect) {
-            if (win->pid == 0) {
-                remote_destroy(win);
-            }
+            remote_destroy(win);
             continue;
         }
 
-        if (pending.msg.pid != 0U) {
-            struct remote_window *pid_win =
-                remote_find_by_pid(pending.msg.pid);
-
-            if (pid_win == NULL &&
-                (pending.msg.type == LV_REMOTE_MSG_HELLO ||
-                 pending.msg.type == LV_REMOTE_MSG_CREATE_WINDOW ||
-                 pending.msg.type == LV_REMOTE_MSG_ATTACH_BUFFER)) {
-                pid_win = remote_alloc_for_pid(pending.msg.pid);
-            }
-
-            if (pid_win != NULL) {
-                win = pid_win;
-            }
+        if (pending.msg.pid != 0U && win->pid == 0) {
+            win->pid = (pid_t)pending.msg.pid;
+        } else if (pending.msg.pid != 0U &&
+                   win->pid != (pid_t)pending.msg.pid) {
+            fprintf(stderr,
+                    "lvgl_desktop: keep fd-bound window %u; ignore pid remap %ld -> %u\n",
+                    win->window_id, (long)win->pid, pending.msg.pid);
         }
 
         if (dispatch_log_count < 64U ||

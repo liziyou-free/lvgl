@@ -127,7 +127,10 @@ static struct pty_ctx g_pty = {
     .child_pid = -1,
 };
 
+static lv_obj_t *g_content;
 static lv_obj_t *g_output;
+static lv_display_t *g_display;
+static void *g_draw_buf;
 static char g_term[TERM_TEXT_CAP];
 static size_t g_term_len;
 static bool g_ctrl_down;
@@ -135,6 +138,7 @@ static volatile sig_atomic_t g_exit_requested;
 
 static void terminal_handle_key(uint32_t key, uint8_t action);
 static void pty_poll_output(struct pty_ctx *pty);
+static int remote_resize_surface(uint32_t width, uint32_t height);
 
 static void signal_handler(int signo)
 {
@@ -352,6 +356,27 @@ static void remote_debug_paint_surface(void)
                              (int32_t)g_remote.height);
 }
 
+static int remote_send_attach_buffer(void)
+{
+    struct lv_remote_msg msg;
+
+    lv_remote_msg_init(&msg, LV_REMOTE_MSG_ATTACH_BUFFER);
+    msg.serial = ++g_remote.serial;
+    msg.width = g_remote.width;
+    msg.height = g_remote.height;
+    msg.stride = g_remote.stride;
+    msg.format = LV_REMOTE_FORMAT_RGB565;
+    msg.pid = (uint32_t)getpid();
+    snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
+    if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
+        fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    set_nonblock(g_remote.socket_fd);
+    return 0;
+}
+
 static int remote_register_window(const char *title)
 {
     struct lv_remote_msg msg;
@@ -372,20 +397,10 @@ static int remote_register_window(const char *title)
         return -1;
     }
 
-    lv_remote_msg_init(&msg, LV_REMOTE_MSG_ATTACH_BUFFER);
-    msg.serial = ++g_remote.serial;
-    msg.width = g_remote.width;
-    msg.height = g_remote.height;
-    msg.stride = g_remote.stride;
-    msg.format = LV_REMOTE_FORMAT_RGB565;
-    msg.pid = (uint32_t)getpid();
-    snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
-    if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
-        fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
+    if (remote_send_attach_buffer() < 0) {
         return -1;
     }
 
-    set_nonblock(g_remote.socket_fd);
     printf("lvgl_remote_terminal: registered '%s' %ux%u %s\n",
            title, g_remote.width, g_remote.height, g_remote.surface_path);
     return 0;
@@ -498,6 +513,12 @@ static void remote_handle_msg(const struct lv_remote_msg *msg)
         terminal_handle_key(msg->key, (uint8_t)msg->action);
         pty_poll_output(&g_pty);
         break;
+    case LV_REMOTE_MSG_CONFIGURE_WINDOW:
+        if (remote_resize_surface(msg->width, msg->height) < 0) {
+            fprintf(stderr, "resize to %ux%u failed\n",
+                    msg->width, msg->height);
+        }
+        break;
     default:
         break;
     }
@@ -565,11 +586,28 @@ static void pointer_register(lv_display_t *disp)
 
 static void term_refresh(void)
 {
+    bool follow_tail = true;
+
     if (g_output == NULL) {
         return;
     }
 
+    if (g_content != NULL) {
+        lv_obj_update_layout(g_content);
+        follow_tail = lv_obj_get_scroll_bottom(g_content) <= 24;
+    }
+
     lv_label_set_text(g_output, g_term);
+
+    if (follow_tail && g_content != NULL) {
+        int32_t scroll_y;
+
+        lv_obj_update_layout(g_content);
+        scroll_y = lv_obj_get_scroll_y(g_content) +
+                   lv_obj_get_scroll_bottom(g_content);
+        lv_obj_scroll_to_y(g_content, scroll_y, LV_ANIM_OFF);
+    }
+
     lv_obj_invalidate(lv_screen_active());
 }
 
@@ -1076,6 +1114,55 @@ static void remote_close_surface(struct remote_ctx *remote)
     }
 }
 
+static int remote_resize_surface(uint32_t width, uint32_t height)
+{
+    void *new_draw_buf;
+
+    if (width == 0 || height <= 44 || width > 4096 || height > 4096) {
+        return -1;
+    }
+
+    remote_close_surface(&g_remote);
+    free(g_draw_buf);
+    g_draw_buf = NULL;
+
+    g_remote.width = width;
+    g_remote.height = height;
+    g_remote.stride = g_remote.width * BYTES_PER_PIXEL;
+    g_remote.surface_len = (size_t)g_remote.stride * g_remote.height;
+
+    if (remote_create_surface(&g_remote) < 0) {
+        return -1;
+    }
+
+    new_draw_buf = malloc(g_remote.surface_len);
+    if (new_draw_buf == NULL) {
+        fprintf(stderr, "malloc resized draw buffer failed\n");
+        return -1;
+    }
+
+    g_draw_buf = new_draw_buf;
+    lv_display_set_resolution(g_display, g_remote.width, g_remote.height);
+    lv_display_set_buffers_with_stride(g_display, g_draw_buf, NULL,
+                                       g_remote.surface_len, g_remote.stride,
+                                       LV_DISPLAY_RENDER_MODE_FULL);
+    lv_obj_set_size(lv_screen_active(), g_remote.width, g_remote.height);
+    if (g_content != NULL) {
+        lv_obj_set_size(g_content, LV_PCT(100), g_remote.height - 44);
+        lv_obj_align(g_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    }
+    term_refresh();
+    lv_obj_invalidate(lv_screen_active());
+
+    if (remote_send_attach_buffer() < 0) {
+        return -1;
+    }
+
+    printf("lvgl_remote_terminal: resized %ux%u %s\n",
+           g_remote.width, g_remote.height, g_remote.surface_path);
+    return 0;
+}
+
 static void pty_poll_output(struct pty_ctx *pty)
 {
     bool updated = false;
@@ -1194,7 +1281,6 @@ static void ui_create(const char *cwd)
     lv_obj_t *scr = lv_screen_active();
     lv_obj_t *header;
     lv_obj_t *title;
-    lv_obj_t *content;
 
     (void)cwd;
 
@@ -1216,17 +1302,17 @@ static void ui_create(const char *cwd)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
 
-    content = lv_obj_create(scr);
-    lv_obj_set_size(content, LV_PCT(100), g_remote.height - 44);
-    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_radius(content, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(content, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(content, 8, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(content, lv_color_hex(0x111827), LV_PART_MAIN);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    g_content = lv_obj_create(scr);
+    lv_obj_set_size(g_content, LV_PCT(100), g_remote.height - 44);
+    lv_obj_align(g_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(g_content, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_content, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_content, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_content, lv_color_hex(0x111827), LV_PART_MAIN);
+    lv_obj_set_flex_flow(g_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    g_output = lv_label_create(content);
+    g_output = lv_label_create(g_content);
     lv_obj_set_width(g_output, LV_PCT(100));
     lv_label_set_long_mode(g_output, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_bg_opa(g_output, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -1248,8 +1334,6 @@ static void parse_args(int argc, char **argv, const char **cwd)
 int main(int argc, char **argv)
 {
     const char *cwd;
-    lv_display_t *disp;
-    void *draw_buf;
 
     parse_args(argc, argv, &cwd);
     g_remote.width = DEFAULT_WIDTH;
@@ -1269,8 +1353,8 @@ int main(int argc, char **argv)
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    draw_buf = malloc(g_remote.surface_len);
-    if (draw_buf == NULL) {
+    g_draw_buf = malloc(g_remote.surface_len);
+    if (g_draw_buf == NULL) {
         fprintf(stderr, "malloc draw buffer failed\n");
         return 1;
     }
@@ -1278,17 +1362,17 @@ int main(int argc, char **argv)
     lv_init();
     lv_tick_set_cb(tick_get_ms);
 
-    disp = lv_display_create(g_remote.width, g_remote.height);
-    if (disp == NULL) {
+    g_display = lv_display_create(g_remote.width, g_remote.height);
+    if (g_display == NULL) {
         fprintf(stderr, "lv_display_create failed\n");
         return 1;
     }
 
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(disp, remote_flush);
-    lv_display_set_buffers_with_stride(disp, draw_buf, NULL, g_remote.surface_len,
+    lv_display_set_color_format(g_display, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(g_display, remote_flush);
+    lv_display_set_buffers_with_stride(g_display, g_draw_buf, NULL, g_remote.surface_len,
                                        g_remote.stride, LV_DISPLAY_RENDER_MODE_FULL);
-    pointer_register(disp);
+    pointer_register(g_display);
     ui_create(cwd);
     term_append("LVGL remote terminal UI ready\n");
 

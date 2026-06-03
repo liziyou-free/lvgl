@@ -45,7 +45,11 @@ static struct remote_ctx g_remote = {
     .surface_fd = -1,
 };
 static lv_obj_t *g_counter_label;
+static lv_display_t *g_display;
+static void *g_draw_buf;
 static int g_counter;
+
+static int remote_resize_surface(uint32_t width, uint32_t height);
 
 static uint32_t tick_get_ms(void)
 {
@@ -193,6 +197,27 @@ static int remote_send_simple(uint32_t type)
     return lv_remote_send_msg(g_remote.socket_fd, &msg);
 }
 
+static int remote_send_attach_buffer(void)
+{
+    struct lv_remote_msg msg;
+
+    lv_remote_msg_init(&msg, LV_REMOTE_MSG_ATTACH_BUFFER);
+    msg.serial = ++g_remote.serial;
+    msg.width = g_remote.width;
+    msg.height = g_remote.height;
+    msg.stride = g_remote.stride;
+    msg.format = LV_REMOTE_FORMAT_RGB565;
+    msg.pid = (uint32_t)getpid();
+    snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
+    if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
+        fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    set_nonblock(g_remote.socket_fd);
+    return 0;
+}
+
 static int remote_register_window(const char *title)
 {
     struct lv_remote_msg msg;
@@ -213,20 +238,10 @@ static int remote_register_window(const char *title)
         return -1;
     }
 
-    lv_remote_msg_init(&msg, LV_REMOTE_MSG_ATTACH_BUFFER);
-    msg.serial = ++g_remote.serial;
-    msg.width = g_remote.width;
-    msg.height = g_remote.height;
-    msg.stride = g_remote.stride;
-    msg.format = LV_REMOTE_FORMAT_RGB565;
-    msg.pid = (uint32_t)getpid();
-    snprintf(msg.path, sizeof(msg.path), "%s", g_remote.surface_path);
-    if (lv_remote_send_msg(g_remote.socket_fd, &msg) < 0) {
-        fprintf(stderr, "send ATTACH_BUFFER failed: %s\n", strerror(errno));
+    if (remote_send_attach_buffer() < 0) {
         return -1;
     }
 
-    set_nonblock(g_remote.socket_fd);
     printf("lvgl_remote_demo: registered '%s' %ux%u %s\n",
            title, g_remote.width, g_remote.height, g_remote.surface_path);
     return 0;
@@ -336,6 +351,12 @@ static void remote_handle_msg(const struct lv_remote_msg *msg)
     case LV_REMOTE_MSG_INPUT_KEY:
         g_remote.last_key = msg->key;
         g_remote.key_pressed = msg->action == LV_REMOTE_KEY_PRESS;
+        break;
+    case LV_REMOTE_MSG_CONFIGURE_WINDOW:
+        if (remote_resize_surface(msg->width, msg->height) < 0) {
+            fprintf(stderr, "resize to %ux%u failed\n",
+                    msg->width, msg->height);
+        }
         break;
     default:
         break;
@@ -472,6 +493,50 @@ static void remote_close_surface(struct remote_ctx *remote)
     }
 }
 
+static int remote_resize_surface(uint32_t width, uint32_t height)
+{
+    void *new_draw_buf;
+
+    if (width == 0 || height == 0 || width > 4096 || height > 4096) {
+        return -1;
+    }
+
+    remote_close_surface(&g_remote);
+    free(g_draw_buf);
+    g_draw_buf = NULL;
+
+    g_remote.width = width;
+    g_remote.height = height;
+    g_remote.stride = g_remote.width * BYTES_PER_PIXEL;
+    g_remote.surface_len = (size_t)g_remote.stride * g_remote.height;
+
+    if (remote_create_surface(&g_remote) < 0) {
+        return -1;
+    }
+
+    new_draw_buf = malloc(g_remote.surface_len);
+    if (new_draw_buf == NULL) {
+        fprintf(stderr, "malloc resized draw buffer failed\n");
+        return -1;
+    }
+
+    g_draw_buf = new_draw_buf;
+    lv_display_set_resolution(g_display, g_remote.width, g_remote.height);
+    lv_display_set_buffers_with_stride(g_display, g_draw_buf, NULL,
+                                       g_remote.surface_len, g_remote.stride,
+                                       LV_DISPLAY_RENDER_MODE_FULL);
+    lv_obj_set_size(lv_screen_active(), g_remote.width, g_remote.height);
+    lv_obj_invalidate(lv_screen_active());
+
+    if (remote_send_attach_buffer() < 0) {
+        return -1;
+    }
+
+    printf("lvgl_remote_demo: resized %ux%u %s\n",
+           g_remote.width, g_remote.height, g_remote.surface_path);
+    return 0;
+}
+
 static void parse_args(int argc, char **argv, uint32_t *width, uint32_t *height)
 {
     *width = DEFAULT_WIDTH;
@@ -494,9 +559,6 @@ static void parse_args(int argc, char **argv, uint32_t *width, uint32_t *height)
 
 int main(int argc, char **argv)
 {
-    lv_display_t *disp;
-    void *draw_buf;
-
     parse_args(argc, argv, &g_remote.width, &g_remote.height);
     g_remote.stride = g_remote.width * BYTES_PER_PIXEL;
     g_remote.surface_len = (size_t)g_remote.stride * g_remote.height;
@@ -510,8 +572,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    draw_buf = malloc(g_remote.surface_len);
-    if (draw_buf == NULL) {
+    g_draw_buf = malloc(g_remote.surface_len);
+    if (g_draw_buf == NULL) {
         fprintf(stderr, "malloc draw buffer failed\n");
         return 1;
     }
@@ -519,18 +581,18 @@ int main(int argc, char **argv)
     lv_init();
     lv_tick_set_cb(tick_get_ms);
 
-    disp = lv_display_create(g_remote.width, g_remote.height);
-    if (disp == NULL) {
+    g_display = lv_display_create(g_remote.width, g_remote.height);
+    if (g_display == NULL) {
         fprintf(stderr, "lv_display_create failed\n");
         return 1;
     }
 
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(disp, remote_flush);
-    lv_display_set_buffers_with_stride(disp, draw_buf, NULL, g_remote.surface_len,
+    lv_display_set_color_format(g_display, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(g_display, remote_flush);
+    lv_display_set_buffers_with_stride(g_display, g_draw_buf, NULL, g_remote.surface_len,
                                        g_remote.stride, LV_DISPLAY_RENDER_MODE_FULL);
 
-    pointer_register(disp);
+    pointer_register(g_display);
     ui_create();
     lv_obj_invalidate(lv_screen_active());
 
