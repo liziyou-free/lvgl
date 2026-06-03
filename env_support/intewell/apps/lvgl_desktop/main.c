@@ -127,6 +127,8 @@ struct remote_window {
     bool active;
     bool focused;
     bool topmost;
+    bool minimized;
+    bool maximized;
     int fd;
     int surface_fd;
     uint32_t window_id;
@@ -136,9 +138,13 @@ struct remote_window {
     uint32_t height;
     uint32_t pending_width;
     uint32_t pending_height;
+    uint32_t restore_width;
+    uint32_t restore_height;
     uint32_t stride;
     uint32_t format;
     pid_t pid;
+    int32_t restore_x;
+    int32_t restore_y;
     size_t surface_len;
     uint8_t *surface;
     uint8_t *image_pixels;
@@ -154,6 +160,8 @@ struct remote_window {
     lv_obj_t *title_label;
     lv_obj_t *image;
     lv_obj_t *resize_handle;
+    lv_obj_t *task_button;
+    lv_obj_t *task_label;
     pthread_t rx_thread;
     bool rx_thread_started;
     pthread_t tx_thread;
@@ -185,6 +193,7 @@ static int g_server_fd = -1;
 static uint32_t g_next_window_id = 1;
 static uint32_t g_next_window_generation = 1;
 static lv_obj_t *g_launcher;
+static lv_obj_t *g_taskbar;
 static lv_obj_t *g_workspace;
 static lv_obj_t *g_status;
 
@@ -245,8 +254,10 @@ static bool g_accept_thread_started;
 
 static void remote_destroy(struct remote_window *win);
 static void remote_composite_surfaces(uint8_t *fb);
+static void remote_focus(struct remote_window *win);
 static void sleep_ms(uint32_t ms);
 static void ui_rebuild_launcher(void);
+static void ui_rebuild_taskbar(void);
 
 static struct remote_window *remote_from_panel(lv_obj_t *panel)
 {
@@ -642,6 +653,18 @@ static void launcher_button_event_cb(lv_event_t *event)
     (void)app_launch(app);
 }
 
+static void task_button_event_cb(lv_event_t *event)
+{
+    struct remote_window *win = lv_event_get_user_data(event);
+
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        win == NULL || !win->active) {
+        return;
+    }
+
+    remote_focus(win);
+}
+
 static struct remote_window *remote_top_window(void)
 {
     uint32_t child_count;
@@ -655,7 +678,8 @@ static struct remote_window *remote_top_window(void)
         lv_obj_t *child = lv_obj_get_child(g_workspace, i);
         struct remote_window *win = remote_from_panel(child);
 
-        if (win != NULL && !lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
+        if (win != NULL && !win->minimized &&
+            !lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
             return win;
         }
     }
@@ -1045,6 +1069,44 @@ static void remote_raise_topmost_windows(void)
     }
 }
 
+static void remote_clamp_panel_to_workspace(struct remote_window *win)
+{
+    int32_t max_x;
+    int32_t max_y;
+    int32_t next_x;
+    int32_t next_y;
+
+    if (win == NULL || win->panel == NULL || g_workspace == NULL) {
+        return;
+    }
+
+    max_x = (int32_t)lv_obj_get_width(g_workspace) -
+            (int32_t)lv_obj_get_width(win->panel);
+    max_y = (int32_t)lv_obj_get_height(g_workspace) -
+            (int32_t)lv_obj_get_height(win->panel);
+    if (max_x < 0) {
+        max_x = 0;
+    }
+    if (max_y < 0) {
+        max_y = 0;
+    }
+
+    next_x = lv_obj_get_x(win->panel);
+    next_y = lv_obj_get_y(win->panel);
+    if (next_x < 0) {
+        next_x = 0;
+    } else if (next_x > max_x) {
+        next_x = max_x;
+    }
+    if (next_y < 0) {
+        next_y = 0;
+    } else if (next_y > max_y) {
+        next_y = max_y;
+    }
+
+    lv_obj_set_pos(win->panel, next_x, next_y);
+}
+
 static void remote_raise_window(struct remote_window *win)
 {
     if (win == NULL || win->panel == NULL || g_workspace == NULL) {
@@ -1065,11 +1127,17 @@ static void remote_focus(struct remote_window *win)
 
     g_focused = win;
     if (g_focused != NULL && g_focused->panel != NULL) {
+        if (g_focused->minimized) {
+            g_focused->minimized = false;
+            lv_obj_remove_flag(g_focused->panel, LV_OBJ_FLAG_HIDDEN);
+        }
         g_focused->focused = true;
         lv_obj_set_style_border_color(g_focused->panel, lv_color_hex(0x2563eb),
                                       LV_PART_MAIN);
         remote_raise_window(g_focused);
     }
+
+    ui_rebuild_taskbar();
 }
 
 static struct remote_window *remote_from_obj(lv_obj_t *obj)
@@ -1092,22 +1160,205 @@ static struct remote_window *remote_from_obj(lv_obj_t *obj)
     return NULL;
 }
 
+static struct remote_window *remote_top_hit_window(void)
+{
+    uint32_t child_count;
+
+    if (g_workspace == NULL) {
+        return NULL;
+    }
+
+    child_count = lv_obj_get_child_count(g_workspace);
+    for (int32_t i = (int32_t)child_count - 1; i >= 0; i--) {
+        lv_obj_t *child = lv_obj_get_child(g_workspace, i);
+        struct remote_window *win = remote_from_panel(child);
+        lv_area_t coords;
+
+        if (win == NULL || !win->active || win->minimized ||
+            lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
+            continue;
+        }
+
+        lv_obj_get_coords(child, &coords);
+        if (g_input.x >= coords.x1 && g_input.x <= coords.x2 &&
+            g_input.y >= coords.y1 && g_input.y <= coords.y2) {
+            return win;
+        }
+    }
+
+    return NULL;
+}
+
+static bool pointer_in_obj(lv_obj_t *obj)
+{
+    lv_area_t coords;
+
+    if (obj == NULL) {
+        return false;
+    }
+
+    lv_obj_get_coords(obj, &coords);
+    return g_input.x >= coords.x1 && g_input.x <= coords.x2 &&
+           g_input.y >= coords.y1 && g_input.y <= coords.y2;
+}
+
+static void window_draw_line(lv_layer_t *layer, lv_color_t color,
+                             int32_t x1, int32_t y1, int32_t x2, int32_t y2)
+{
+    lv_draw_line_dsc_t dsc;
+
+    lv_draw_line_dsc_init(&dsc);
+    dsc.p1.x = x1;
+    dsc.p1.y = y1;
+    dsc.p2.x = x2;
+    dsc.p2.y = y2;
+    dsc.color = color;
+    dsc.width = 2;
+    dsc.opa = LV_OPA_COVER;
+    dsc.round_start = 1;
+    dsc.round_end = 1;
+    lv_draw_line(layer, &dsc);
+}
+
+static void window_button_draw_event_cb(lv_event_t *event)
+{
+    uintptr_t kind = (uintptr_t)lv_event_get_user_data(event);
+    lv_obj_t *button = lv_event_get_target(event);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_area_t a;
+
+    if (lv_event_get_code(event) != LV_EVENT_DRAW_POST || layer == NULL) {
+        return;
+    }
+
+    lv_obj_get_coords(button, &a);
+    if (kind == 0U) {
+        lv_color_t color = lv_color_hex(0x7f1d1d);
+
+        window_draw_line(layer, color, a.x1 + 4, a.y1 + 4, a.x2 - 4, a.y2 - 4);
+        window_draw_line(layer, color, a.x2 - 4, a.y1 + 4, a.x1 + 4, a.y2 - 4);
+    } else if (kind == 1U) {
+        window_draw_line(layer, lv_color_hex(0x713f12),
+                         a.x1 + 3, a.y1 + 6, a.x2 - 3, a.y1 + 6);
+    } else {
+        lv_color_t color = lv_color_hex(0x14532d);
+
+        window_draw_line(layer, color, a.x1 + 4, a.y2 - 4, a.x2 - 4, a.y1 + 4);
+        window_draw_line(layer, color, a.x2 - 4, a.y1 + 4, a.x2 - 4, a.y1 + 8);
+        window_draw_line(layer, color, a.x2 - 4, a.y1 + 4, a.x2 - 8, a.y1 + 4);
+    }
+}
+
 static void window_close_event_cb(lv_event_t *event)
 {
-    lv_obj_t *target = lv_event_get_target(event);
-    struct remote_window *win = remote_from_obj(target);
+    struct remote_window *win;
 
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    win = remote_top_hit_window();
+    if (win == NULL || !pointer_in_obj(win->close_button)) {
+        return;
+    }
     remote_request_close(win);
+}
+
+static void remote_minimize(struct remote_window *win)
+{
+    if (win == NULL || win->panel == NULL) {
+        return;
+    }
+
+    win->minimized = true;
+    win->focused = false;
+    lv_obj_add_flag(win->panel, LV_OBJ_FLAG_HIDDEN);
+    if (g_focused == win) {
+        g_focused = NULL;
+        remote_focus(remote_top_window());
+    } else {
+        ui_rebuild_taskbar();
+    }
+}
+
+static void remote_toggle_maximize(struct remote_window *win)
+{
+    uint32_t next_w;
+    uint32_t next_h;
+
+    if (win == NULL || win->panel == NULL || g_workspace == NULL) {
+        return;
+    }
+
+    remote_focus(win);
+    if (!win->maximized) {
+        int32_t max_w;
+        int32_t max_h;
+
+        win->restore_x = lv_obj_get_x(win->panel);
+        win->restore_y = lv_obj_get_y(win->panel);
+        win->restore_width = win->width;
+        win->restore_height = win->height;
+        max_w = (int32_t)lv_obj_get_width(g_workspace) - WINDOW_EXTRA_W;
+        max_h = (int32_t)lv_obj_get_height(g_workspace) - WINDOW_EXTRA_H;
+        if (max_w < WINDOW_MIN_CONTENT_W) {
+            max_w = WINDOW_MIN_CONTENT_W;
+        }
+        if (max_h < WINDOW_MIN_CONTENT_H) {
+            max_h = WINDOW_MIN_CONTENT_H;
+        }
+        next_w = (uint32_t)max_w;
+        next_h = (uint32_t)max_h;
+        win->maximized = true;
+        lv_obj_set_pos(win->panel, 0, 0);
+        remote_resize_ui(win, next_w, next_h);
+    } else {
+        next_w = win->restore_width > 0U ? win->restore_width : win->width;
+        next_h = win->restore_height > 0U ? win->restore_height : win->height;
+        win->maximized = false;
+        lv_obj_set_pos(win->panel, win->restore_x, win->restore_y);
+        remote_resize_ui(win, next_w, next_h);
+        remote_clamp_panel_to_workspace(win);
+    }
+
+    if (next_w != win->width || next_h != win->height) {
+        remote_send_configure(win, next_w, next_h);
+    }
+    ui_rebuild_taskbar();
+}
+
+static void window_minimize_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        struct remote_window *win = remote_top_hit_window();
+
+        if (win != NULL && pointer_in_obj(win->min_button)) {
+            remote_minimize(win);
+        }
+    }
+}
+
+static void window_zoom_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        struct remote_window *win = remote_top_hit_window();
+
+        if (win != NULL && pointer_in_obj(win->zoom_button)) {
+            remote_toggle_maximize(win);
+        }
+    }
 }
 
 static void window_focus_event_cb(lv_event_t *event)
 {
     lv_event_code_t code = lv_event_get_code(event);
-    lv_obj_t *target = lv_event_get_target(event);
-    struct remote_window *win = remote_from_obj(target);
 
     if (code == LV_EVENT_PRESSED) {
-        remote_focus(win);
+        struct remote_window *win = remote_top_hit_window();
+
+        if (win != NULL) {
+            remote_focus(win);
+        }
     }
 }
 
@@ -1116,18 +1367,27 @@ static void window_drag_event_cb(lv_event_t *event)
     lv_event_code_t code = lv_event_get_code(event);
     lv_obj_t *target = lv_event_get_target(event);
     struct remote_window *win = remote_from_obj(target);
+    struct remote_window *hit;
 
     if (win == NULL || win->panel == NULL) {
         return;
     }
 
+    if (win->maximized) {
+        return;
+    }
+
     if (code == LV_EVENT_PRESSED) {
-        remote_focus(win);
-        g_drag.win = win;
+        hit = remote_top_hit_window();
+        if (hit == NULL || hit != win || !pointer_in_obj(hit->title_bar)) {
+            return;
+        }
+        remote_focus(hit);
+        g_drag.win = hit;
         g_drag.start_x = g_input.x;
         g_drag.start_y = g_input.y;
-        g_drag.panel_x = lv_obj_get_x(win->panel);
-        g_drag.panel_y = lv_obj_get_y(win->panel);
+        g_drag.panel_x = lv_obj_get_x(hit->panel);
+        g_drag.panel_y = lv_obj_get_y(hit->panel);
         g_drag.active = true;
     } else if (code == LV_EVENT_PRESSING && g_drag.active && g_drag.win == win) {
         int32_t next_x = g_drag.panel_x + (int32_t)g_input.x - g_drag.start_x;
@@ -1170,18 +1430,27 @@ static void window_resize_event_cb(lv_event_t *event)
     lv_event_code_t code = lv_event_get_code(event);
     lv_obj_t *target = lv_event_get_target(event);
     struct remote_window *win = remote_from_obj(target);
+    struct remote_window *hit;
 
     if (win == NULL || win->panel == NULL) {
         return;
     }
 
+    if (win->maximized) {
+        return;
+    }
+
     if (code == LV_EVENT_PRESSED) {
-        remote_focus(win);
-        g_resize.win = win;
+        hit = remote_top_hit_window();
+        if (hit == NULL || hit != win || !pointer_in_obj(hit->resize_handle)) {
+            return;
+        }
+        remote_focus(hit);
+        g_resize.win = hit;
         g_resize.start_x = g_input.x;
         g_resize.start_y = g_input.y;
-        g_resize.start_w = (uint32_t)lv_obj_get_width(win->image);
-        g_resize.start_h = (uint32_t)lv_obj_get_height(win->image);
+        g_resize.start_w = (uint32_t)lv_obj_get_width(hit->image);
+        g_resize.start_h = (uint32_t)lv_obj_get_height(hit->image);
         g_resize.active = true;
     } else if (code == LV_EVENT_PRESSING && g_resize.active &&
                g_resize.win == win) {
@@ -1221,6 +1490,7 @@ static void window_resize_event_cb(lv_event_t *event)
             uint32_t next_h = (uint32_t)lv_obj_get_height(win->image);
 
             if (next_w != win->width || next_h != win->height) {
+                win->maximized = false;
                 remote_send_configure(win, next_w, next_h);
             }
             memset(&g_resize, 0, sizeof(g_resize));
@@ -1285,9 +1555,15 @@ static void remote_composite_window(struct remote_window *win, uint8_t *fb,
     uint32_t height;
     static int composite_log_count;
 
-    if (win == NULL || !win->active || win->image == NULL ||
+    if (win == NULL || !win->active || win->minimized ||
+        win->image == NULL ||
         win->image_pixels == NULL || fb == NULL ||
         win->width == 0 || win->height == 0) {
+        return;
+    }
+
+    if (win->panel != NULL &&
+        lv_obj_has_flag(win->panel, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
 
@@ -1345,7 +1621,7 @@ static void remote_composite_window(struct remote_window *win, uint8_t *fb,
             lv_area_t cover;
             size_t next_count = 0;
 
-            if (cover_win == NULL ||
+            if (cover_win == NULL || cover_win->minimized ||
                 lv_obj_has_flag(cover_panel, LV_OBJ_FLAG_HIDDEN)) {
                 continue;
             }
@@ -1415,7 +1691,9 @@ static void remote_composite_surfaces(uint8_t *fb)
         lv_obj_t *child = lv_obj_get_child(g_workspace, i);
 
         for (size_t j = 0; j < MAX_REMOTE_WINDOWS; j++) {
-            if (g_windows[j].active && g_windows[j].panel == child) {
+            if (g_windows[j].active && !g_windows[j].minimized &&
+                g_windows[j].panel == child &&
+                !lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
                 remote_composite_window(&g_windows[j], fb, i);
                 break;
             }
@@ -1435,6 +1713,7 @@ static void route_pointer_to_remote(void)
     for (int32_t i = (int32_t)child_count - 1; i >= 0; i--) {
         lv_obj_t *child = lv_obj_get_child(g_workspace, i);
         struct remote_window *win = remote_from_panel(child);
+        lv_area_t panel_coords;
         lv_area_t coords;
 
         if (win == NULL || !win->active || win->image == NULL ||
@@ -1446,10 +1725,16 @@ static void route_pointer_to_remote(void)
             return;
         }
 
+        lv_obj_get_coords(child, &panel_coords);
+        if (g_input.x < panel_coords.x1 || g_input.x > panel_coords.x2 ||
+            g_input.y < panel_coords.y1 || g_input.y > panel_coords.y2) {
+            continue;
+        }
+
         lv_obj_get_coords(win->image, &coords);
         if (g_input.x < coords.x1 || g_input.x > coords.x2 ||
             g_input.y < coords.y1 || g_input.y > coords.y2) {
-            continue;
+            return;
         }
 
         if (g_input.pressed && !g_input.last_pressed) {
@@ -1825,6 +2110,9 @@ static void remote_destroy(struct remote_window *win)
     if (win->panel != NULL) {
         lv_obj_delete(win->panel);
     }
+    win->panel = NULL;
+    win->task_button = NULL;
+    win->task_label = NULL;
 
     if (win->surface != NULL) {
         munmap(win->surface, win->surface_len);
@@ -1855,6 +2143,7 @@ static void remote_destroy(struct remote_window *win)
     memset(win, 0, sizeof(*win));
     win->fd = -1;
     win->surface_fd = -1;
+    ui_rebuild_taskbar();
 }
 
 static void remote_create_ui(struct remote_window *win)
@@ -1902,6 +2191,9 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0xff5f57), LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, window_button_draw_event_cb, LV_EVENT_DRAW_POST,
+                        (void *)0U);
     lv_obj_add_event_cb(btn, window_close_event_cb, LV_EVENT_CLICKED, NULL);
 
     btn = lv_button_create(win->title_bar);
@@ -1911,6 +2203,10 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0xffbd2e), LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, window_button_draw_event_cb, LV_EVENT_DRAW_POST,
+                        (void *)1U);
+    lv_obj_add_event_cb(btn, window_minimize_event_cb, LV_EVENT_CLICKED, NULL);
 
     btn = lv_button_create(win->title_bar);
     win->zoom_button = btn;
@@ -1919,6 +2215,10 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x28c840), LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, window_button_draw_event_cb, LV_EVENT_DRAW_POST,
+                        (void *)2U);
+    lv_obj_add_event_cb(btn, window_zoom_event_cb, LV_EVENT_CLICKED, NULL);
 
     win->title_label = lv_label_create(win->title_bar);
     lv_label_set_text_fmt(win->title_label, "%s #%u", win->title, win->window_id);
@@ -1952,6 +2252,7 @@ static void remote_create_ui(struct remote_window *win)
     lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(win->resize_handle, window_resize_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    ui_rebuild_taskbar();
 }
 
 static int remote_attach_buffer(struct remote_window *win, const struct lv_remote_msg *msg)
@@ -2013,6 +2314,7 @@ static int remote_attach_buffer(struct remote_window *win, const struct lv_remot
 
     remote_focus(win);
     lv_obj_invalidate(win->image);
+    ui_rebuild_taskbar();
     printf("lvgl_desktop: window %u attached %ux%u stride=%u pos=%ld,%ld %s\n",
            win->window_id, win->width, win->height, win->stride,
            (long)lv_obj_get_x(win->panel), (long)lv_obj_get_y(win->panel),
@@ -2110,6 +2412,11 @@ static void remote_handle_msg(struct remote_window *win,
             win->height = msg->height;
         }
         win->topmost = (msg->flags & LV_REMOTE_WINDOW_TOPMOST) != 0U;
+        if (win->title_label != NULL) {
+            lv_label_set_text_fmt(win->title_label, "%s #%u",
+                                  win->title, win->window_id);
+        }
+        ui_rebuild_taskbar();
         printf("lvgl_desktop: window %u create '%s' %ux%u pid=%ld\n",
                win->window_id, win->title, win->width, win->height,
                (long)win->pid);
@@ -2262,6 +2569,63 @@ static void ui_rebuild_launcher(void)
     }
 }
 
+static void ui_rebuild_taskbar(void)
+{
+    bool added = false;
+
+    if (g_taskbar == NULL) {
+        return;
+    }
+
+    while (lv_obj_get_child_count(g_taskbar) > 0U) {
+        lv_obj_delete(lv_obj_get_child(g_taskbar, 0));
+    }
+
+    for (size_t i = 0; i < MAX_REMOTE_WINDOWS; i++) {
+        struct remote_window *win = &g_windows[i];
+        lv_obj_t *btn;
+        lv_obj_t *label;
+        char text[96];
+
+        win->task_button = NULL;
+        win->task_label = NULL;
+        if (!win->active || win->panel == NULL) {
+            continue;
+        }
+
+        btn = lv_button_create(g_taskbar);
+        win->task_button = btn;
+        lv_obj_set_size(btn, LV_PCT(100), LAUNCHER_BUTTON_HEIGHT);
+        lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(btn,
+                                  win->focused ? lv_color_hex(0x2563eb) :
+                                  win->minimized ? lv_color_hex(0x475569) :
+                                  lv_color_hex(0x334155),
+                                  LV_PART_MAIN);
+        lv_obj_add_event_cb(btn, task_button_event_cb, LV_EVENT_CLICKED, win);
+
+        label = lv_label_create(btn);
+        win->task_label = label;
+        snprintf(text, sizeof(text), "%s%s #%u",
+                 win->minimized ? "[ ] " : "",
+                 win->title[0] != '\0' ? win->title : "Remote App",
+                 win->window_id);
+        lv_label_set_text(label, text);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_center(label);
+        added = true;
+    }
+
+    if (!added) {
+        lv_obj_t *label = lv_label_create(g_taskbar);
+
+        lv_label_set_text(label, "No windows");
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_obj_set_style_text_color(label, lv_color_hex(0x94a3b8), LV_PART_MAIN);
+    }
+}
+
 static void app_registry_autostart(void)
 {
     for (size_t i = 0; i < g_app_count; i++) {
@@ -2275,6 +2639,7 @@ static void ui_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_t *bar;
+    lv_obj_t *sidebar;
     lv_obj_t *title;
 
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f172a), LV_PART_MAIN);
@@ -2300,16 +2665,38 @@ static void ui_create(void)
     lv_obj_set_style_text_color(g_status, lv_color_hex(0x9ca3af), LV_PART_MAIN);
     lv_obj_align(g_status, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    g_launcher = lv_obj_create(scr);
-    lv_obj_set_size(g_launcher, LAUNCHER_WIDTH, g_fb.height - 40);
-    lv_obj_align(g_launcher, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    sidebar = lv_obj_create(scr);
+    lv_obj_set_size(sidebar, LAUNCHER_WIDTH, g_fb.height - 40);
+    lv_obj_align(sidebar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_radius(sidebar, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sidebar, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sidebar, lv_color_hex(0x1e293b), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(sidebar, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(sidebar, 8, LV_PART_MAIN);
+    lv_obj_set_flex_flow(sidebar, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(sidebar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    g_launcher = lv_obj_create(sidebar);
+    lv_obj_set_size(g_launcher, LV_PCT(100), (g_fb.height - 40) / 2 - 14);
     lv_obj_set_style_radius(g_launcher, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(g_launcher, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(g_launcher, lv_color_hex(0x1e293b), LV_PART_MAIN);
-    lv_obj_set_style_pad_all(g_launcher, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_launcher, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_launcher, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_row(g_launcher, 6, LV_PART_MAIN);
     lv_obj_set_flex_flow(g_launcher, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_launcher, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    g_taskbar = lv_obj_create(sidebar);
+    lv_obj_set_size(g_taskbar, LV_PCT(100), (g_fb.height - 40) / 2 - 14);
+    lv_obj_set_style_radius(g_taskbar, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_taskbar, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_taskbar, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_taskbar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(g_taskbar, 6, LV_PART_MAIN);
+    lv_obj_set_flex_flow(g_taskbar, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_taskbar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START);
 
     g_workspace = lv_obj_create(scr);
@@ -2389,6 +2776,7 @@ int main(int argc, char **argv)
     ui_create();
     app_registry_load(g_app_dir);
     ui_rebuild_launcher();
+    ui_rebuild_taskbar();
     app_registry_autostart();
     lv_obj_invalidate(lv_screen_active());
 
